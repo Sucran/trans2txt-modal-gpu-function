@@ -1,0 +1,9 @@
+.python-version
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.DS_Store
+.env
+config.env
