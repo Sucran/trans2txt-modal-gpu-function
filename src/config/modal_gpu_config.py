@@ -3,16 +3,25 @@ Modal GPU endpoint configuration
 Handles GPU endpoint deployment and configuration
 """
 
-import modal
 import os
+import sys
+from pathlib import Path
+
+import modal
+
+# `modal deploy` on this file loads it as a top-level module (not as `src.config.*`),
+# so `from .modal_shared` fails. Prefer imports from the repo root.
+_repo_root = Path(__file__).resolve().parents[1]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
 # Import shared configuration
-from .modal_shared import (
+from src.config.modal_shared import (
     app,
     volume,
     cache_dir,
     transcription_image,
-    secrets
+    secrets,
 )
 
 # GPU endpoint configuration from environment variables
