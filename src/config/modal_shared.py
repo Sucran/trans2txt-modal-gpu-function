@@ -26,21 +26,16 @@ if env_path.exists():
 MODAL_APP_NAME = os.getenv("MODAL_APP_NAME", "transcribe-modal-gpu")
 app = modal.App(name=MODAL_APP_NAME)
 
-# Opt-in: `Secret.from_name` does not validate at import time; deploy would fail
-# if this is set without creating the secret in the target workspace.
-hf_secret = None
-if os.getenv("ATTACH_HUGGINGFACE_SECRET", "false").lower() == "true":
-    try:
-        hf_secret = modal.Secret.from_name("huggingface-secret")
-        print("Attached Hugging Face secret (ATTACH_HUGGINGFACE_SECRET=true)")
-    except Exception as e:
-        print(f"ATTACH_HUGGINGFACE_SECRET=true but lookup failed: {e}")
-        hf_secret = None
-else:
-    print(
-        "Hugging Face secret not attached (set ATTACH_HUGGINGFACE_SECRET=true "
-        "after creating modal secret 'huggingface-secret')"
-    )
+# `huggingface-secret` is a HARD requirement for speaker diarization (pyannote
+# is gated on Hugging Face). We deliberately attach it unconditionally so that
+# the function's dependency set is identical at deploy time and at container
+# runtime — any conditional `secrets=...` arg here will trip Modal's
+# "Function has N dependencies but container got M object ids" guard, because
+# the container re-imports this module without local config files.
+#
+# Provision once with:
+#   modal secret create huggingface-secret HF_TOKEN=hf_xxx
+hf_secret = modal.Secret.from_name("huggingface-secret")
 
 volume = modal.Volume.from_name("cache-volume", create_if_missing=True)
 cache_dir = "/root/cache"
@@ -137,9 +132,9 @@ transcription_image = (
     )
     .run_function(
         download_transcription_models,
-        secrets=[hf_secret] if hf_secret else [],
+        secrets=[hf_secret],
     )
     .add_local_dir(str(project_root / "src"), remote_path="/root/src")
 )
 
-secrets = [hf_secret] if hf_secret else []
+secrets = [hf_secret]

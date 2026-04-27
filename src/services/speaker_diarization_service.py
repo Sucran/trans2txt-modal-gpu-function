@@ -223,7 +223,25 @@ class SpeakerDiarizationService:
             # 3. 预处理音频（转换为标准格式）
             preprocessed_path = self._preprocess_audio_for_diarization(temp_file_path)
             preprocessed_file_created = (preprocessed_path != temp_file_path)
-            
+
+            # 3.5 Pipeline 健康检查：HF_TOKEN 缺失或加载失败时直接 failed，
+            # 避免上游把 "[] segments + status=success" 误读为 "音频里没说话人"。
+            if self._load_pipeline() is None:
+                hf_token_present = bool(
+                    os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_TOKEN")
+                )
+                msg = (
+                    "Speaker diarization pipeline unavailable: "
+                    + ("pyannote pipeline failed to load" if hf_token_present
+                       else "HF_TOKEN not found (huggingface-secret not attached?)")
+                )
+                print(f"❌ {msg}")
+                return {
+                    "processing_status": "failed",
+                    "error_message": msg,
+                    "segments": [],
+                }
+
             # 4. 调用 diarize_audio()
             segments = self.diarize_audio(preprocessed_path)
             
