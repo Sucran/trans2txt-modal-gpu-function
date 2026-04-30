@@ -29,63 +29,164 @@ class SpeakerDiarizationService:
         """
         self.cache_dir = cache_dir
         self._pipeline = None  # Lazy loading
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _positive_int(value: Any) -> Optional[int]:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _diarization_batch_config(self, request_data: Optional[dict] = None) -> Dict[str, int]:
+        request_data = request_data or {}
+        hints = request_data.get("speaker_hints")
+        if not isinstance(hints, dict):
+            hints = {}
+
+        segmentation_batch_size = (
+            self._positive_int(request_data.get("segmentation_batch_size"))
+            or self._positive_int(hints.get("segmentation_batch_size"))
+            or self._positive_int(os.getenv("PYANNOTE_SEGMENTATION_BATCH_SIZE"))
+            or 128
+        )
+        embedding_batch_size = (
+            self._positive_int(request_data.get("embedding_batch_size"))
+            or self._positive_int(hints.get("embedding_batch_size"))
+            or self._positive_int(os.getenv("PYANNOTE_EMBEDDING_BATCH_SIZE"))
+            or 128
+        )
+        return {
+            "segmentation_batch_size": segmentation_batch_size,
+            "embedding_batch_size": embedding_batch_size,
+        }
+
+    def _apply_pipeline_batch_config(self, pipeline: Any, batch_config: Dict[str, int]) -> None:
+        segmentation_batch_size = batch_config["segmentation_batch_size"]
+        embedding_batch_size = batch_config["embedding_batch_size"]
+
+        if hasattr(pipeline, "segmentation_batch_size"):
+            pipeline.segmentation_batch_size = segmentation_batch_size
+        if hasattr(pipeline, "embedding_batch_size"):
+            pipeline.embedding_batch_size = embedding_batch_size
+
+        print(
+            "⚙️ Pyannote batch config: "
+            f"segmentation_batch_size={getattr(pipeline, 'segmentation_batch_size', segmentation_batch_size)}, "
+            f"embedding_batch_size={getattr(pipeline, 'embedding_batch_size', embedding_batch_size)}"
+        )
+
+    def _speaker_count_kwargs(self, request_data: Optional[dict] = None) -> Dict[str, int]:
+        request_data = request_data or {}
+        hints = request_data.get("speaker_hints")
+        if not isinstance(hints, dict):
+            hints = {}
+
+        num_speakers = (
+            self._positive_int(request_data.get("num_speakers"))
+            or self._positive_int(hints.get("num_speakers"))
+        )
+        if num_speakers:
+            return {"num_speakers": num_speakers}
+
+        min_speakers = (
+            self._positive_int(request_data.get("min_speakers"))
+            or self._positive_int(hints.get("min_speakers"))
+        )
+        max_speakers = (
+            self._positive_int(request_data.get("max_speakers"))
+            or self._positive_int(hints.get("max_speakers"))
+        )
+        if min_speakers and max_speakers and min_speakers > max_speakers:
+            print(
+                "⚠️ Ignoring invalid speaker bounds: "
+                f"min_speakers={min_speakers}, max_speakers={max_speakers}"
+            )
+            return {}
+
+        kwargs: Dict[str, int] = {}
+        if min_speakers:
+            kwargs["min_speakers"] = min_speakers
+        if max_speakers:
+            kwargs["max_speakers"] = max_speakers
+        return kwargs
+
+    def _pipeline_audio_input(self, audio_file_path: str) -> Any:
+        if not self._env_bool("PYANNOTE_USE_MEMORY_INPUT", True):
+            return audio_file_path
+
+        try:
+            import torchaudio
+
+            waveform, sample_rate = torchaudio.load(audio_file_path)
+            print(
+                "📦 Loaded diarization audio into memory: "
+                f"shape={tuple(waveform.shape)}, sample_rate={sample_rate}"
+            )
+            return {"waveform": waveform, "sample_rate": sample_rate}
+        except Exception as e:
+            print(f"⚠️ Failed to load audio into memory, falling back to file path: {e}")
+            return audio_file_path
     
     def _load_pipeline(self):
         """
-        Lazy load pyannote.audio pipeline
-        
+        Lazy load the pyannote.audio pipeline from the baked HF cache.
+
+        The image build (``download_transcription_models``) preloads weights
+        into ``HF_HOME=/model/hf-cache`` and the image sets
+        ``HF_HUB_OFFLINE=1`` afterwards, so this loader does **not** need an
+        HF token at runtime. If loading fails, the cache is broken and the
+        operator should redeploy the GPU image.
+
         Returns:
-            Pipeline instance or None if HF_TOKEN is not available
+            Pipeline instance, or ``None`` if the pipeline could not be loaded.
         """
         if self._pipeline is not None:
             return self._pipeline
-        
-        # 确保 HF_TOKEN 已设置
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_TOKEN")
-        if not hf_token:
-            print("⚠️ HF_TOKEN not found, speaker diarization will be disabled")
-            return None
-        
+
         try:
             from pyannote.audio import Pipeline
             import torch
-            
-            # 设置缓存目录
-            os.environ["PYANNOTE_CACHE"] = "/model/speaker-diarization"
-            
-            # 启用 TF32 以提高性能和精度（根据 pyannote.audio 的建议）
-            # 警告提示禁用 TF32 可能导致精度问题和较低准确性
-            # 注意：必须只使用一种 API（旧 API），因为 pyannote.audio 内部使用旧 API 检查
-            # 混合使用新旧 API 会导致 RuntimeError
+
+            # 启用 TF32 以提高性能和精度（pyannote.audio 的 fix_reproducibility
+            # 内部使用旧 API 检查，所以这里也只能用旧 API，避免冲突）。
             if torch.cuda.is_available():
                 try:
-                    # 只使用旧 API，避免与 pyannote.audio 内部检查冲突
-                    # pyannote.audio 的 fix_reproducibility 函数使用旧 API 检查 TF32 状态
-                    if hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
+                    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
                         torch.backends.cuda.matmul.allow_tf32 = True
-                    if hasattr(torch.backends.cudnn, 'allow_tf32'):
+                    if hasattr(torch.backends.cudnn, "allow_tf32"):
                         torch.backends.cudnn.allow_tf32 = True
                     print("✅ TF32 enabled for better performance and accuracy (using legacy API)")
                 except Exception as e:
                     print(f"⚠️ Failed to enable TF32: {e}")
-            
-            print("📥 Loading speaker diarization pipeline...")
-            # 加载 pipeline
+
+            print("📥 Loading speaker diarization pipeline from baked HF cache...")
             self._pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-community-1"
             )
-            
-            # 移动到 GPU（如果可用）
+
             if torch.cuda.is_available():
                 self._pipeline.to(torch.device("cuda"))
                 print("✅ Pipeline loaded and moved to GPU")
             else:
                 print("⚠️ CUDA not available, using CPU")
-            
+
+            self._apply_pipeline_batch_config(
+                self._pipeline,
+                self._diarization_batch_config(),
+            )
+
             return self._pipeline
-            
+
         except Exception as e:
-            print(f"❌ Failed to load pipeline: {e}")
+            print(f"❌ Failed to load pipeline from cache: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -217,6 +318,8 @@ class SpeakerDiarizationService:
             temp_file.write(audio_bytes)
             temp_file.close()
             temp_file_path = temp_file.name
+            audio_file_data = None
+            del audio_bytes
             
             print(f"💾 Saved audio to temporary file: {temp_file_path}")
             
@@ -224,16 +327,18 @@ class SpeakerDiarizationService:
             preprocessed_path = self._preprocess_audio_for_diarization(temp_file_path)
             preprocessed_file_created = (preprocessed_path != temp_file_path)
 
-            # 3.5 Pipeline 健康检查：HF_TOKEN 缺失或加载失败时直接 failed，
-            # 避免上游把 "[] segments + status=success" 误读为 "音频里没说话人"。
+            # 3.5 Pipeline 健康检查：加载失败时直接 failed，避免上游把
+            # "[] segments + status=success" 误读为 "音频里没说话人"。模型权重
+            # 在镜像构建时就烘焙进了 HF 缓存，运行时使用 HF_HUB_OFFLINE=1，
+            # 所以这里失败几乎只可能是镜像缓存损坏，需要重新部署 GPU 镜像。
             if self._load_pipeline() is None:
-                hf_token_present = bool(
-                    os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_TOKEN")
-                )
                 msg = (
-                    "Speaker diarization pipeline unavailable: "
-                    + ("pyannote pipeline failed to load" if hf_token_present
-                       else "HF_TOKEN not found (huggingface-secret not attached?)")
+                    "Speaker diarization pipeline unavailable: failed to load "
+                    "pyannote weights from the baked HF cache "
+                    "(/model/hf-cache). The GPU image is likely missing the "
+                    "build-time download step — redeploy the GPU app via the "
+                    "transcribe-modal-bridge so the image is rebuilt with the "
+                    "Hugging Face cache populated."
                 )
                 print(f"❌ {msg}")
                 return {
@@ -242,8 +347,20 @@ class SpeakerDiarizationService:
                     "segments": [],
                 }
 
+            batch_config = self._diarization_batch_config(request_data)
+            speaker_kwargs = self._speaker_count_kwargs(request_data)
+            print(
+                "🎚️ Diarization request config: "
+                f"batch={batch_config}, speaker_kwargs={speaker_kwargs or '{}'}"
+            )
+
             # 4. 调用 diarize_audio()
-            segments = self.diarize_audio(preprocessed_path)
+            segments = self.diarize_audio(
+                preprocessed_path,
+                batch_config=batch_config,
+                speaker_kwargs=speaker_kwargs,
+                already_preprocessed=True,
+            )
             
             # 5. 清理临时文件
             try:
@@ -259,7 +376,12 @@ class SpeakerDiarizationService:
             # 5. 返回结果
             return {
                 "processing_status": "success",
-                "segments": segments
+                "segments": segments,
+                "diarization_config": {
+                    **batch_config,
+                    **speaker_kwargs,
+                    "memory_input": self._env_bool("PYANNOTE_USE_MEMORY_INPUT", True),
+                },
             }
             
         except Exception as e:
@@ -281,7 +403,13 @@ class SpeakerDiarizationService:
                 "segments": []
             }
     
-    def diarize_audio(self, audio_file_path: str) -> List[Dict]:
+    def diarize_audio(
+        self,
+        audio_file_path: str,
+        batch_config: Optional[Dict[str, int]] = None,
+        speaker_kwargs: Optional[Dict[str, int]] = None,
+        already_preprocessed: bool = False,
+    ) -> List[Dict]:
         """
         执行说话人识别
         
@@ -302,14 +430,39 @@ class SpeakerDiarizationService:
             if not os.path.exists(audio_file_path):
                 raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
             
+            batch_config = batch_config or self._diarization_batch_config()
+            speaker_kwargs = speaker_kwargs or {}
+            self._apply_pipeline_batch_config(pipeline, batch_config)
+
             # 2. 预处理音频（如果还没有预处理）
-            # 注意：如果是从 process_diarization_request 调用，音频已经预处理过
-            # 但如果是直接调用 diarize_audio，需要在这里预处理
-            preprocessed_path = self._preprocess_audio_for_diarization(audio_file_path)
+            preprocessed_path = (
+                audio_file_path
+                if already_preprocessed
+                else self._preprocess_audio_for_diarization(audio_file_path)
+            )
             print(f"🎤 Running speaker diarization on: {preprocessed_path}")
-            
-            # 3. 运行 diarization（按照之前的代码，直接对结果调用 itertracks）
-            diarization_result = pipeline(preprocessed_path)
+
+            pipeline_input = self._pipeline_audio_input(preprocessed_path)
+            use_progress_hook = self._env_bool("PYANNOTE_PROGRESS_HOOK", True)
+
+            # 3. 运行 diarization。Batch size 在 pipeline 属性上配置；speaker count
+            # constraints 作为 apply 参数传入，pyannote 4.x 支持这些参数。
+            ProgressHook = None
+            if use_progress_hook:
+                try:
+                    from pyannote.audio.pipelines.utils.hook import ProgressHook
+                except Exception as e:
+                    print(f"⚠️ ProgressHook unavailable, running without hook: {e}")
+
+            if ProgressHook is not None:
+                with ProgressHook() as hook:
+                    diarization_result = pipeline(
+                        pipeline_input,
+                        hook=hook,
+                        **speaker_kwargs,
+                    )
+            else:
+                diarization_result = pipeline(pipeline_input, **speaker_kwargs)
             
             
             # 4. 格式化结果（按照之前的代码逻辑）

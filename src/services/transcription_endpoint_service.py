@@ -143,7 +143,7 @@ class TranscriptionEndpointService:
             audio_file_data = request_data.get("audio_file_data")
             audio_file_name = request_data.get("audio_file_name", "chunk.mp3")
             # Get model_size from request, or use default from configuration
-            model_size = request_data.get("model_size") or os.getenv("DEFAULT_MODEL_SIZE", "turbo")
+            model_size = request_data.get("model_size") or os.getenv("DEFAULT_MODEL_SIZE", "large-v3")
             language = request_data.get("language", "auto")  # Default to "auto" for automatic detection
             enable_speaker_diarization = request_data.get("enable_speaker_diarization", False)
             chunk_start_time = request_data.get("chunk_start_time", 0)

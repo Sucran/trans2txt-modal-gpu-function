@@ -14,7 +14,7 @@ class WhisperService:
     Runs Whisper model and optionally extracts speaker embeddings
     """
     
-    def __init__(self, cache_dir: str = "/tmp", model_size: str = "turbo"):
+    def __init__(self, cache_dir: str = "/tmp", model_size: str = "large-v3"):
         self.cache_dir = cache_dir
         self.model_size = model_size
         
@@ -23,7 +23,7 @@ class WhisperService:
         self.model = self._load_cached_model(model_size)
         print(f"✅ Whisper model ({model_size}) preloaded successfully")
     
-    def _load_cached_model(self, model_size: str = "turbo"):
+    def _load_cached_model(self, model_size: str = "large-v3"):
         """Load Whisper model from cache directory if available"""
         try:
             # Try to load from preloaded cache first
