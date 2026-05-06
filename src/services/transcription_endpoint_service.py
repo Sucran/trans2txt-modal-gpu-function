@@ -22,6 +22,26 @@ _cached_model_size: Optional[str] = None
 _cache_lock = threading.Lock()
 
 
+def _read_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _read_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 class TranscriptionEndpointService:
     """Service for processing transcription endpoint requests (Service layer)"""
     
@@ -185,7 +205,54 @@ class TranscriptionEndpointService:
                 if result.get("processing_status") == "success":
                     result["chunk_start_time"] = chunk_start_time
                     result["chunk_end_time"] = chunk_end_time
-                
+
+                    # Ensure pause fields are present. ``transcribe_audio``
+                    # already attaches them on the success path, but a legacy
+                    # ``WhisperService`` (or a future variant) might not. As a
+                    # defensive fallback, run silencedetect best-effort here
+                    # and degrade to ``[]`` on any failure.
+                    if "pause_intervals" not in result:
+                        min_dur_s = _read_env_float(
+                            "PAUSE_DETECT_MIN_DUR", 0.4
+                        )
+                        noise_db = _read_env_int(
+                            "PAUSE_DETECT_NOISE_DB", -35
+                        )
+                        try:
+                            from .whisper_service import WhisperService
+
+                            fallback_intervals = WhisperService._detect_pauses(
+                                str(temp_audio_path),
+                                min_dur_s=min_dur_s,
+                                noise_db=noise_db,
+                            )
+                        except Exception as fallback_err:
+                            print(
+                                "⚠️ pause-detect fallback raised, degrading to []: "
+                                f"{fallback_err!r}"
+                            )
+                            fallback_intervals = []
+                        result["pause_intervals"] = fallback_intervals
+                        result.setdefault(
+                            "pause_detect_meta",
+                            {
+                                "min_dur_s": float(min_dur_s),
+                                "noise_db": int(noise_db),
+                                "schema_version": 1,
+                            },
+                        )
+
+                    pause_intervals = result.get("pause_intervals") or []
+                    total_pause_ms = sum(
+                        int(item.get("dur_ms", 0) or 0)
+                        for item in pause_intervals
+                    )
+                    print(
+                        f"🛑 chunk pause_intervals count={len(pause_intervals)} "
+                        f"total≈{total_pause_ms / 1000.0:.2f}s "
+                        f"(chunk_start={chunk_start_time:.2f}s)"
+                    )
+
                 print(f"✅ Chunk transcription completed on server")
                 return result
                 

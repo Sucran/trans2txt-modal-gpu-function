@@ -5,7 +5,21 @@ Handles audio transcription using Whisper model on GPU
 
 import whisper
 import os
+import re
+import subprocess
 from typing import Dict, Any, List
+
+
+# Parse ffmpeg ``silencedetect`` stderr lines, e.g.
+#   [silencedetect @ 0x...] silence_end: 12.345 | silence_duration: 0.789
+# Mirrors the regex used in transcribe-modal-cpu's ``split_audio_by_silence``
+# for parity. Tolerant of optional whitespace around the colon and pipe so
+# minor ffmpeg-version differences in formatting do not silently break us.
+_SILENCE_END_RE = re.compile(
+    r"silence_end:\s*(?P<end>[0-9]+(?:\.[0-9]+)?)"
+    r"\s*\|\s*"
+    r"silence_duration:\s*(?P<dur>[0-9]+(?:\.[0-9]+)?)"
+)
 
 
 class WhisperService:
@@ -40,7 +54,97 @@ class WhisperService:
         except Exception as e:
             print(f"⚠️ Failed to load cached model, downloading: {e}")
             return whisper.load_model(model_size)
-    
+
+    @staticmethod
+    def _detect_pauses(
+        audio_file_path: str,
+        *,
+        min_dur_s: float,
+        noise_db: int,
+    ) -> List[Dict[str, int]]:
+        """Run ffmpeg ``silencedetect`` against ``audio_file_path``.
+
+        Returns a list of ``{start_ms, end_ms, dur_ms, mid_ms}`` intervals with
+        all times **CHUNK-LOCAL** — relative to the wav passed in. The CPU
+        orchestrator is responsible for shifting them to the global timeline
+        with ``chunk_start_time``; do NOT apply that offset here.
+
+        Failure isolation: any exception (ffmpeg missing, parse error, etc.)
+        is caught and the function returns ``[]`` after logging. It must
+        never propagate, since pause detection is best-effort and must not
+        fail transcription.
+        """
+        try:
+            cmd = [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-i",
+                audio_file_path,
+                "-af",
+                f"silencedetect=noise={int(noise_db)}dB:duration={float(min_dur_s)}",
+                "-f",
+                "null",
+                "-",
+            ]
+
+            process = subprocess.Popen(
+                cmd,
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+
+            intervals: List[Dict[str, int]] = []
+            stderr_stream = process.stderr
+            if stderr_stream is not None:
+                for line in stderr_stream:
+                    try:
+                        match = _SILENCE_END_RE.search(line)
+                        if not match:
+                            continue
+                        silence_end = float(match.group("end"))
+                        silence_dur = float(match.group("dur"))
+                    except Exception as line_err:
+                        print(
+                            f"⚠️ pause line parse failed (skipped): {line_err!r}"
+                        )
+                        continue
+
+                    end_ms = int(round(silence_end * 1000))
+                    dur_ms = int(round(silence_dur * 1000))
+                    if dur_ms <= 0 or end_ms <= 0:
+                        continue
+                    start_ms = end_ms - dur_ms
+                    if start_ms < 0:
+                        # Clamp at chunk start while preserving end_ms.
+                        start_ms = 0
+                        dur_ms = end_ms
+                    mid_ms = start_ms + dur_ms // 2
+                    intervals.append(
+                        {
+                            "start_ms": start_ms,
+                            "end_ms": end_ms,
+                            "dur_ms": dur_ms,
+                            "mid_ms": mid_ms,
+                        }
+                    )
+
+            try:
+                process.wait()
+            except Exception as wait_err:
+                print(f"⚠️ ffmpeg wait failed (ignored): {wait_err!r}")
+
+            intervals.sort(key=lambda item: item["start_ms"])
+            return intervals
+
+        except FileNotFoundError as err:
+            print(f"⚠️ pause detection unavailable (ffmpeg missing?): {err!r}")
+            return []
+        except Exception as err:
+            print(f"⚠️ pause detection failed for {audio_file_path}: {err!r}")
+            return []
+
     def transcribe_audio(
         self,
         audio_file_path: str,
@@ -117,7 +221,37 @@ class WhisperService:
             print(f"   Segments: {len(segments)}")
             print(f"   Duration: {audio_duration:.2f}s")
             print(f"   Language: {language_detected}")
-            
+
+            # Pause detection (chunk-local). Failure must not break transcription.
+            min_dur_s = _read_env_float("PAUSE_DETECT_MIN_DUR", 0.4)
+            noise_db = _read_env_int("PAUSE_DETECT_NOISE_DB", -35)
+            try:
+                pause_intervals = self._detect_pauses(
+                    audio_file_path,
+                    min_dur_s=min_dur_s,
+                    noise_db=noise_db,
+                )
+            except Exception as pause_err:
+                # Defensive: _detect_pauses already swallows internally, but
+                # keep an outer guard so a programming error here cannot
+                # bubble up and fail the transcription path.
+                print(f"⚠️ pause detection raised unexpectedly: {pause_err!r}")
+                pause_intervals = []
+
+            pause_detect_meta = {
+                "min_dur_s": float(min_dur_s),
+                "noise_db": int(noise_db),
+                "schema_version": 1,
+            }
+            total_pause_ms = sum(
+                int(item.get("dur_ms", 0) or 0) for item in pause_intervals
+            )
+            print(
+                f"   Pause intervals (chunk-local): {len(pause_intervals)} "
+                f"≈{total_pause_ms / 1000.0:.2f}s "
+                f"(min_dur={min_dur_s}s noise={noise_db}dB)"
+            )
+
             # Build segments list
             segments_list = []
             for seg in segments:
@@ -139,7 +273,9 @@ class WhisperService:
                 "speaker_summary": speaker_summary,
                 "language_detected": language_detected,
                 "text": text,
-                "segments": segments_list
+                "segments": segments_list,
+                "pause_intervals": pause_intervals,
+                "pause_detect_meta": pause_detect_meta,
             }
             
         except Exception as e:
@@ -159,6 +295,28 @@ class WhisperService:
             "language_detected": "unknown",
             "error_message": error_message,
             "text": "",
-            "segments": []
+            "segments": [],
+            "pause_intervals": [],
+            "pause_detect_meta": {},
         }
 
+
+def _read_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _read_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        # Tolerate values like ``"-35.0"`` from older configs.
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return int(default)

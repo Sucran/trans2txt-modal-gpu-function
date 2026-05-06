@@ -76,6 +76,13 @@ hf_build_secret = modal.Secret.from_dict({"HF_TOKEN": _hf_token_for_build})
 
 runtime_env = {
     "DEFAULT_MODEL_SIZE": os.getenv("DEFAULT_MODEL_SIZE", "large-v3"),
+    "ASR_BACKEND": os.getenv("ASR_BACKEND", "whisper"),
+    "QWEN_ASR_MODEL_ID": os.getenv(
+        "QWEN_ASR_MODEL_ID", "Qwen/Qwen3-ASR-0.6B"
+    ),
+    "QWEN_FORCED_ALIGNER_MODEL_ID": os.getenv(
+        "QWEN_FORCED_ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B"
+    ),
     "PYANNOTE_SEGMENTATION_BATCH_SIZE": os.getenv("PYANNOTE_SEGMENTATION_BATCH_SIZE", "128"),
     "PYANNOTE_EMBEDDING_BATCH_SIZE": os.getenv("PYANNOTE_EMBEDDING_BATCH_SIZE", "128"),
     "PYANNOTE_USE_MEMORY_INPUT": os.getenv("PYANNOTE_USE_MEMORY_INPUT", "true"),
@@ -136,6 +143,18 @@ def download_transcription_models() -> None:
     Model.from_pretrained("pyannote/embedding", token=hf_token)
     print("Speaker embedding model cached")
 
+    print("Downloading Qwen3-ASR + ForcedAligner snapshots into HF cache...")
+    from huggingface_hub import snapshot_download
+
+    qwen_asr_id = _os.getenv("QWEN_ASR_MODEL_ID", "Qwen/Qwen3-ASR-0.6B")
+    qwen_align_id = _os.getenv(
+        "QWEN_FORCED_ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B"
+    )
+    snapshot_download(qwen_asr_id, token=hf_token)
+    print(f"Cached ASR weights: {qwen_asr_id}")
+    snapshot_download(qwen_align_id, token=hf_token)
+    print(f"Cached ForcedAligner weights: {qwen_align_id}")
+
 
 # Image construction. Order matters:
 #   1. Set HF_HOME / HF_HUB_CACHE so the build *and* runtime read the same
@@ -173,6 +192,7 @@ transcription_image = (
         "huggingface_hub",
         "pyannote.audio>=4.0.0",
         "omegaconf",
+        "qwen-asr",
     )
     .run_function(
         download_transcription_models,
