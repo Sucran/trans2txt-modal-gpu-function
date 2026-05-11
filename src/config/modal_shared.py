@@ -127,7 +127,62 @@ def download_transcription_models() -> None:
     whisper.load_model(model_size, download_root="/model")
     print(f"Whisper {model_size} model downloaded and cached")
 
-    print("Downloading speaker diarization models into HF cache...")
+    # Modal / non-TTY logs often swallow tqdm carriage-return updates, so we
+    # pre-fetch with ``snapshot_download`` (shows hub progress) and set hub
+    # verbosity to INFO. ``Pipeline.from_pretrained`` may still pull linked
+    # checkpoints; prints bracket that phase.
+    _os.environ.setdefault("HF_HUB_VERBOSITY", "info")
+
+    import huggingface_hub.utils.logging as _hf_log
+
+    _hf_log.set_verbosity_info()
+
+    from huggingface_hub import snapshot_download
+
+    def _snapshot_with_heartbeat(repo_id: str, label: str) -> str:
+        """HF parallel downloads occasionally stall; fewer workers + heartbeats help."""
+
+        import threading
+
+        stop = threading.Event()
+
+        def _beat() -> None:
+            # Long quiet periods are normal while a single multi-GB shard downloads.
+            while not stop.wait(45.0):
+                print(
+                    f"  ... heartbeat: {label} — still downloading "
+                    "(large weights can keep one tqdm bar unchanged for many minutes) ...",
+                    flush=True,
+                )
+
+        th = threading.Thread(target=_beat, daemon=True)
+        th.start()
+        try:
+            return snapshot_download(repo_id, token=hf_token, max_workers=2)
+        finally:
+            stop.set()
+
+    diarization_repo = "pyannote/speaker-diarization-community-1"
+    embedding_repo = "pyannote/embedding"
+
+    print(
+        "Prefetching speaker diarization HF repos (snapshot_download; "
+        "may take several minutes; watch tqdm % or INFO lines below)...",
+        flush=True,
+    )
+    print(f"  snapshot: {diarization_repo}", flush=True)
+    _snapshot_with_heartbeat(diarization_repo, diarization_repo)
+    print(f"  snapshot done: {diarization_repo}", flush=True)
+    print(f"  snapshot: {embedding_repo}", flush=True)
+    _snapshot_with_heartbeat(embedding_repo, embedding_repo)
+    print(f"  snapshot done: {embedding_repo}", flush=True)
+
+    _os.environ["PYANNOTE_PROGRESS_HOOK"] = _os.getenv("PYANNOTE_PROGRESS_HOOK", "true")
+    print(
+        "Instantiating pyannote Pipeline / Model from HF cache "
+        "(may download linked sub-checkpoints)...",
+        flush=True,
+    )
     from pyannote.audio import Pipeline, Model
 
     # ``token=`` is the explicit pyannote 4.x argument; the env var is a fallback
@@ -135,24 +190,23 @@ def download_transcription_models() -> None:
     # it is a no-op in pyannote >= 4 and the standard HF cache is the only
     # location consulted at runtime.
     Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-community-1",
+        diarization_repo,
         token=hf_token,
     )
-    print("Speaker diarization pipeline cached")
+    print("Speaker diarization pipeline cached", flush=True)
 
-    Model.from_pretrained("pyannote/embedding", token=hf_token)
-    print("Speaker embedding model cached")
+    Model.from_pretrained(embedding_repo, token=hf_token)
+    print("Speaker embedding model cached", flush=True)
 
     print("Downloading Qwen3-ASR + ForcedAligner snapshots into HF cache...")
-    from huggingface_hub import snapshot_download
 
     qwen_asr_id = _os.getenv("QWEN_ASR_MODEL_ID", "Qwen/Qwen3-ASR-0.6B")
     qwen_align_id = _os.getenv(
         "QWEN_FORCED_ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B"
     )
-    snapshot_download(qwen_asr_id, token=hf_token)
+    _snapshot_with_heartbeat(qwen_asr_id, qwen_asr_id)
     print(f"Cached ASR weights: {qwen_asr_id}")
-    snapshot_download(qwen_align_id, token=hf_token)
+    _snapshot_with_heartbeat(qwen_align_id, qwen_align_id)
     print(f"Cached ForcedAligner weights: {qwen_align_id}")
 
 
