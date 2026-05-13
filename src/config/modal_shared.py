@@ -78,15 +78,17 @@ runtime_env = {
     "DEFAULT_MODEL_SIZE": os.getenv("DEFAULT_MODEL_SIZE", "large-v3"),
     "ASR_BACKEND": os.getenv("ASR_BACKEND", "whisper"),
     "QWEN_ASR_MODEL_ID": os.getenv(
-        "QWEN_ASR_MODEL_ID", "Qwen/Qwen3-ASR-0.6B"
+        "QWEN_ASR_MODEL_ID", "Qwen/Qwen3-ASR-1.7B"
     ),
+    "QWEN_ALLOWED_ASR_MODEL_IDS": os.getenv("QWEN_ALLOWED_ASR_MODEL_IDS", ""),
     "QWEN_FORCED_ALIGNER_MODEL_ID": os.getenv(
         "QWEN_FORCED_ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B"
     ),
     "QWEN_ALIGNER_MAX_SEGMENT_SECONDS": os.getenv(
-        "QWEN_ALIGNER_MAX_SEGMENT_SECONDS", "180"
+        "QWEN_ALIGNER_MAX_SEGMENT_SECONDS", "60"
     ),
     "QWEN_MAX_NEW_TOKENS": os.getenv("QWEN_MAX_NEW_TOKENS", "1024"),
+    "QWEN_ASR_CONTEXT": os.getenv("QWEN_ASR_CONTEXT", ""),
     "QWEN_SUBTITLE_MAX_SECONDS": os.getenv("QWEN_SUBTITLE_MAX_SECONDS", "1.6"),
     "QWEN_SUBTITLE_MAX_CHARS": os.getenv("QWEN_SUBTITLE_MAX_CHARS", "12"),
     "QWEN_SUBTITLE_GAP_SECONDS": os.getenv("QWEN_SUBTITLE_GAP_SECONDS", "0.35"),
@@ -207,7 +209,7 @@ def download_transcription_models() -> None:
 
     print("Downloading Qwen3-ASR + ForcedAligner snapshots into HF cache...")
 
-    qwen_asr_id = _os.getenv("QWEN_ASR_MODEL_ID", "Qwen/Qwen3-ASR-0.6B")
+    qwen_asr_id = _os.getenv("QWEN_ASR_MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
     qwen_align_id = _os.getenv(
         "QWEN_FORCED_ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B"
     )
@@ -226,7 +228,7 @@ def download_transcription_models() -> None:
 #      to huggingface.co — even if a stray network call were attempted.
 transcription_image = (
     modal.Image.debian_slim(python_version=PYTHON_VERSION)
-    .env({"HF_HOME": HF_HOME_PATH, "HF_HUB_CACHE": HF_HUB_CACHE_PATH})
+    .env({"HF_HOME": HF_HOME_PATH, "HF_HUB_CACHE": HF_HUB_CACHE_PATH, **runtime_env})
     .apt_install(
         "ffmpeg",
         "wget",

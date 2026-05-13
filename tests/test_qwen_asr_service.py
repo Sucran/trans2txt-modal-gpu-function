@@ -78,6 +78,15 @@ class _FakeFfmpeg:
         return _FakeFfmpegChain(self.outputs)
 
 
+class _FakeQwenModel:
+    def __init__(self):
+        self.calls: list[dict[str, object]] = []
+
+    def transcribe(self, **kwargs: object) -> list[str]:
+        self.calls.append(kwargs)
+        return ["ok"]
+
+
 class QwenAsrServiceHelperTests(unittest.TestCase):
     def test_dtype_auto_uses_fp16_when_bf16_is_not_supported(self) -> None:
         self.assertEqual(qwen._select_torch_dtype(_FakeTorch(True, False)), "fp16")
@@ -89,6 +98,18 @@ class QwenAsrServiceHelperTests(unittest.TestCase):
         self.assertEqual(qwen._normalise_language("zh-CN"), "Chinese")
         self.assertTrue(qwen._is_aligner_language(qwen._normalise_language("zh-CN")))
         self.assertFalse(qwen._is_aligner_language(qwen._normalise_language("th")))
+
+    def test_transcribe_one_forwards_context_to_qwen_model(self) -> None:
+        service = object.__new__(qwen.QwenAsrService)
+        fake_model = _FakeQwenModel()
+        service.model = fake_model
+
+        result = service._transcribe_one("/tmp/audio.mp3", "Chinese", "CFO 陈震")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(fake_model.calls[0]["context"], "CFO 陈震")
+        self.assertEqual(fake_model.calls[0]["language"], "Chinese")
+        self.assertTrue(fake_model.calls[0]["return_time_stamps"])
 
     def test_parse_time_stamps_accepts_tuples_dicts_and_objects(self) -> None:
         service = object.__new__(qwen.QwenAsrService)
@@ -112,17 +133,17 @@ class QwenAsrServiceHelperTests(unittest.TestCase):
     def test_iter_aligner_inputs_splits_long_audio_at_limit(self) -> None:
         service = object.__new__(qwen.QwenAsrService)
         fake = _FakeFfmpeg()
-        with mock.patch.object(qwen, "MAX_ALIGNER_SEGMENT_SECONDS", 180):
+        with mock.patch.object(qwen, "MAX_ALIGNER_SEGMENT_SECONDS", 60):
             with mock.patch.object(qwen, "ffmpeg", fake):
-                items = list(service._iter_aligner_inputs("/tmp/in.m4a", 370.0, "/tmp/qwen"))
+                items = list(service._iter_aligner_inputs("/tmp/in.m4a", 125.0, "/tmp/qwen"))
 
         self.assertEqual(
             [(round(start), round(end)) for _path, start, end in items],
-            [(0, 180), (180, 360), (360, 370)],
+            [(0, 60), (60, 120), (120, 125)],
         )
         self.assertEqual(
             [(round(call["ss"]), round(call["t"])) for call in fake.inputs],
-            [(0, 180), (180, 180), (360, 10)],
+            [(0, 60), (60, 60), (120, 5)],
         )
         self.assertEqual(len(fake.outputs), 3)
 

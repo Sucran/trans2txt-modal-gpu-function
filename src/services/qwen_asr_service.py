@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import ffmpeg
 
 
-MAX_ALIGNER_SEGMENT_SECONDS = int(os.getenv("QWEN_ALIGNER_MAX_SEGMENT_SECONDS", "180"))
+MAX_ALIGNER_SEGMENT_SECONDS = int(os.getenv("QWEN_ALIGNER_MAX_SEGMENT_SECONDS", "60"))
 DEFAULT_SUBTITLE_MAX_SECONDS = 1.6
 DEFAULT_SUBTITLE_MAX_CHARS = 12
 DEFAULT_SUBTITLE_GAP_SECONDS = 0.35
@@ -92,6 +92,12 @@ def _normalise_language(language: Optional[str]) -> Optional[str]:
     if not value or value.lower() == "auto":
         return None
     return LANGUAGE_ALIASES.get(value.lower(), value)
+
+
+def _normalise_context(context: Optional[str]) -> str:
+    if context is None:
+        return ""
+    return str(context).strip()
 
 
 def _is_aligner_language(language: Optional[str]) -> bool:
@@ -199,7 +205,7 @@ class QwenAsrService:
     def __init__(
         self,
         cache_dir: str = "/tmp",
-        asr_model_id: str = "Qwen/Qwen3-ASR-0.6B",
+        asr_model_id: str = "Qwen/Qwen3-ASR-1.7B",
         aligner_model_id: str = "Qwen/Qwen3-ForcedAligner-0.6B",
     ):
         self.cache_dir = cache_dir
@@ -235,6 +241,7 @@ class QwenAsrService:
         self,
         audio_file_path: str,
         language: Optional[str] = None,
+        context: Optional[str] = None,
         enable_speaker_diarization: bool = False,
     ) -> Dict[str, Any]:
         try:
@@ -242,6 +249,7 @@ class QwenAsrService:
                 print("⚠️ Qwen3-ASR chunk diarization is ignored; CPU merges full-audio pyannote diarization")
 
             requested_language = _normalise_language(language)
+            context_text = _normalise_context(context)
             if requested_language and not _is_aligner_language(requested_language):
                 raise AlignerLanguageUnsupported(
                     f"Qwen3-ForcedAligner does not support requested language: {requested_language}"
@@ -250,7 +258,8 @@ class QwenAsrService:
             duration = self._probe_duration(audio_file_path)
             print(
                 f"🎤 [QwenAsrService] Starting transcription: {audio_file_path} "
-                f"duration={duration:.2f}s language={requested_language or 'auto'}"
+                f"duration={duration:.2f}s language={requested_language or 'auto'} "
+                f"context={'on' if context_text else 'off'} len={len(context_text)}"
             )
 
             raw_segments: List[Dict[str, Any]] = []
@@ -261,7 +270,7 @@ class QwenAsrService:
                 for sub_path, sub_start, _sub_end in self._iter_aligner_inputs(
                     audio_file_path, duration, tmp_dir
                 ):
-                    result = self._transcribe_one(sub_path, requested_language)
+                    result = self._transcribe_one(sub_path, requested_language, context_text)
                     detected_language = str(getattr(result, "language", "") or "unknown")
                     if not _is_aligner_language(_normalise_language(detected_language)):
                         raise AlignerLanguageUnsupported(
@@ -309,6 +318,8 @@ class QwenAsrService:
                 "text": full_text,
                 "segments": segments,
                 "segment_aggregation": self._aggregation_metadata(),
+                "qwen_context_enabled": bool(context_text),
+                "qwen_context_length": len(context_text),
             }
 
         except AlignerLanguageUnsupported:
@@ -329,10 +340,11 @@ class QwenAsrService:
                 "segments": [],
             }
 
-    def _transcribe_one(self, audio_path: str, language: Optional[str]) -> Any:
+    def _transcribe_one(self, audio_path: str, language: Optional[str], context: Optional[str]) -> Any:
         try:
             results = self.model.transcribe(
                 audio=audio_path,
+                context=_normalise_context(context),
                 language=language,
                 return_time_stamps=True,
             )

@@ -25,6 +25,7 @@ class _CachedBackend:
 
 _cached_backend: Optional[_CachedBackend] = None
 _cache_lock = threading.Lock()
+DEFAULT_QWEN_ASR_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
 
 
 def _read_env_float(name: str, default: float) -> float:
@@ -45,6 +46,17 @@ def _read_env_int(name: str, default: int) -> int:
         return int(float(str(raw).strip()))
     except (TypeError, ValueError):
         return int(default)
+
+
+def _split_csv(value: str) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _allowed_qwen_asr_model_ids(configured_model_id: str) -> set[str]:
+    allowed = set(_split_csv(os.getenv("QWEN_ALLOWED_ASR_MODEL_IDS", "")))
+    if configured_model_id:
+        allowed.add(configured_model_id)
+    return allowed
 
 
 class TranscriptionEndpointService:
@@ -187,13 +199,21 @@ class TranscriptionEndpointService:
             # Get model_size from request, or use default from configuration.
             # model_size remains Whisper-only; Qwen uses asr_model_id.
             model_size = request_data.get("model_size") or os.getenv("DEFAULT_MODEL_SIZE", "large-v3")
+            # CPU/product routing should pass asr_backend per request based on
+            # the user's plan. ASR_BACKEND is only a backwards-compatible
+            # fallback for older callers.
             asr_backend = str(
                 request_data.get("asr_backend")
                 or os.getenv("ASR_BACKEND", "whisper")
             ).strip().lower()
-            asr_model_id = request_data.get("asr_model_id") or os.getenv(
-                "QWEN_ASR_MODEL_ID",
-                "Qwen/Qwen3-ASR-0.6B",
+            configured_qwen_model_id = os.getenv("QWEN_ASR_MODEL_ID", DEFAULT_QWEN_ASR_MODEL_ID)
+            asr_model_id = str(
+                request_data.get("asr_model_id") or configured_qwen_model_id
+            ).strip()
+            qwen_context = (
+                request_data.get("qwen_context")
+                if request_data.get("qwen_context") is not None
+                else request_data.get("asr_context", os.getenv("QWEN_ASR_CONTEXT", ""))
             )
             language = request_data.get("language", "auto")  # Default to "auto" for automatic detection
             enable_speaker_diarization = request_data.get("enable_speaker_diarization", False)
@@ -206,6 +226,20 @@ class TranscriptionEndpointService:
                     "error_message": "No audio data provided",
                     "chunk_start_time": chunk_start_time,
                     "chunk_end_time": chunk_end_time
+                }
+
+            if (
+                asr_backend == "qwen3_asr"
+                and asr_model_id not in _allowed_qwen_asr_model_ids(configured_qwen_model_id)
+            ):
+                return {
+                    "processing_status": "failed",
+                    "error_message": (
+                        "Qwen ASR model is not allowed for this deployment: "
+                        f"{asr_model_id}"
+                    ),
+                    "chunk_start_time": chunk_start_time,
+                    "chunk_end_time": chunk_end_time,
                 }
             
             # Decode audio data and save to temporary file
@@ -228,6 +262,7 @@ class TranscriptionEndpointService:
                         asr_model_id=asr_model_id,
                         model_size=model_size,
                         language=language,
+                        qwen_context=qwen_context,
                         enable_speaker_diarization=enable_speaker_diarization,
                     )
                 elif asr_backend == "whisper":
@@ -334,6 +369,7 @@ class TranscriptionEndpointService:
         asr_model_id: str,
         model_size: str,
         language: Any,
+        qwen_context: Any,
         enable_speaker_diarization: bool,
     ) -> Dict[str, Any]:
         try:
@@ -343,6 +379,7 @@ class TranscriptionEndpointService:
             return service.transcribe_audio(
                 audio_file_path=audio_file_path,
                 language=language,
+                context=qwen_context,
                 enable_speaker_diarization=enable_speaker_diarization,
             )
         except AlignerLanguageUnsupported as exc:

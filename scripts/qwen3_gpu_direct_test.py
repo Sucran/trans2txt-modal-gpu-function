@@ -163,6 +163,8 @@ def build_payload(clip_path: Path, clip_seconds: int, case: Dict[str, Any]) -> D
         payload["asr_backend"] = case["asr_backend"]
     if case.get("asr_model_id"):
         payload["asr_model_id"] = case["asr_model_id"]
+    if case.get("qwen_context"):
+        payload["qwen_context"] = case["qwen_context"]
     return payload
 
 
@@ -250,7 +252,7 @@ def validate_result(name: str, clip_seconds: int, result: Dict[str, Any]) -> Lis
     return issues
 
 
-def comparison_cases(old_app: str, new_app: str) -> List[Dict[str, Any]]:
+def comparison_cases(old_app: str, new_app: str, qwen_context: str = "") -> List[Dict[str, Any]]:
     return [
         {
             "name": "old_whisper",
@@ -269,6 +271,7 @@ def comparison_cases(old_app: str, new_app: str) -> List[Dict[str, Any]]:
             "app": new_app,
             "asr_backend": "qwen3_asr",
             "language": "auto",
+            "qwen_context": qwen_context,
         },
         {
             "name": "fallback",
@@ -309,6 +312,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only download and cut clips; do not call Modal.",
     )
+    parser.add_argument(
+        "--qwen-context",
+        default=os.getenv("QWEN_ASR_CONTEXT", ""),
+        help="Optional Qwen3-ASR context hints for proper nouns/acronyms.",
+    )
     return parser.parse_args()
 
 
@@ -335,7 +343,10 @@ def main() -> int:
         _log("prepare-only complete")
         return 0
 
-    allowed_cases = {case["name"]: case for case in comparison_cases(args.old_app, args.new_app)}
+    allowed_cases = {
+        case["name"]: case
+        for case in comparison_cases(args.old_app, args.new_app, args.qwen_context)
+    }
     case_names = [item.strip() for item in args.cases.split(",") if item.strip()]
     cases = [allowed_cases[name] for name in case_names]
 
@@ -344,6 +355,8 @@ def main() -> int:
         "original_audio": str(original),
         "old_app": args.old_app,
         "new_app": args.new_app,
+        "qwen_context_enabled": bool(args.qwen_context.strip()),
+        "qwen_context_length": len(args.qwen_context.strip()),
         "clips": {},
         "issues": [],
     }

@@ -30,11 +30,22 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
   - `MODAL_APP_NAME` (default `transcribe-modal-gpu`)
   - `MODAL_GPU_TYPE` (default `T4`)
   - `MODAL_CPU`, `MODAL_MEMORY`, `MODAL_GPU_TIMEOUT` etc.
-  - `ASR_BACKEND` (`whisper` by default; set `qwen3_asr` to use Qwen3-ASR)
+  - `ASR_BACKEND` is only the fallback for older callers that do not pass
+    `asr_backend`. Product routing should be done per request by the CPU
+    function, based on the user's plan, with `asr_backend=whisper` or
+    `asr_backend=qwen3_asr`.
   - `QWEN_ASR_MODEL_ID` / `QWEN_FORCED_ALIGNER_MODEL_ID` for the Qwen3-ASR
-    transformers backend. ForcedAligner is mandatory on the Qwen path so SRT
-    timestamps keep the same contract as Whisper segments. T4 deployments use
-    FP16 automatically; newer GPUs use BF16 when supported.
+    transformers backend. The default ASR model is `Qwen/Qwen3-ASR-1.7B` for
+    accuracy; `Qwen/Qwen3-ASR-0.6B` is the faster throughput-oriented option.
+    ForcedAligner is mandatory on the Qwen path so SRT timestamps keep the same
+    contract as Whisper segments. T4 deployments use FP16 automatically; newer
+    GPUs use BF16 when supported.
+  - `QWEN_ALLOWED_ASR_MODEL_IDS` optionally allowlists request-level
+    `asr_model_id` overrides. Blank means only the configured
+    `QWEN_ASR_MODEL_ID` is accepted.
+  - `QWEN_ASR_CONTEXT` optionally provides Qwen3-ASR contextual hints for proper
+    nouns, acronyms, and domain terms. Prefer request-level `qwen_context` when
+    the product layer knows episode/title-specific vocabulary.
   - `QWEN_SUBTITLE_MAX_SECONDS` / `QWEN_SUBTITLE_MAX_CHARS` /
     `QWEN_SUBTITLE_GAP_SECONDS` tune Qwen forced-align timestamp aggregation
     into subtitle-sized segments (defaults `1.6` / `12` / `0.35`, tuned to a
@@ -79,8 +90,13 @@ untouched and use a distinct Modal app name:
 export HF_TOKEN=hf_your_token_here
 export MODAL_APP_NAME=transcribe-modal-gpu-qwen3-dev
 export MODAL_GPU_TYPE=T4
+# Keep the fallback as Whisper; CPU decides Whisper vs Qwen per request by plan.
 export ASR_BACKEND=whisper
-export QWEN_ALIGNER_MAX_SEGMENT_SECONDS=180
+export QWEN_ASR_MODEL_ID=Qwen/Qwen3-ASR-1.7B
+export QWEN_ALLOWED_ASR_MODEL_IDS=""
+export QWEN_FORCED_ALIGNER_MODEL_ID=Qwen/Qwen3-ForcedAligner-0.6B
+export QWEN_ASR_CONTEXT=""
+export QWEN_ALIGNER_MAX_SEGMENT_SECONDS=60
 export QWEN_SUBTITLE_MAX_SECONDS=1.6
 export QWEN_SUBTITLE_MAX_CHARS=12
 export QWEN_SUBTITLE_GAP_SECONDS=0.35
