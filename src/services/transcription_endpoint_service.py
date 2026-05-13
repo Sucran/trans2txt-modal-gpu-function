@@ -8,17 +8,22 @@ import base64
 import os
 import threading
 import gc
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Tuple
 
 from ..utils.file_utils import write_file_bytes, cleanup_temp_file, ensure_directory_exists_path
 
-# 模块级缓存：缓存 WhisperService 实例以避免重复加载模型
-# 限制：只能存在一个实例，如果 model_size 改变则释放旧实例
-# 在 Modal 容器生命周期内，实例会被复用
-# 使用线程锁保证并发安全
-_cached_whisper_service: Optional[Any] = None
-_cached_model_size: Optional[str] = None
+# Module-level cache: keep one GPU-heavy backend loaded per container.
+# Switching between Whisper and Qwen releases the previous backend to avoid VRAM
+# pressure from large-v3 + Qwen3-ASR + ForcedAligner co-residency.
+@dataclass
+class _CachedBackend:
+    key: Tuple[str, str]
+    service: Any
+
+
+_cached_backend: Optional[_CachedBackend] = None
 _cache_lock = threading.Lock()
 
 
@@ -54,30 +59,30 @@ class TranscriptionEndpointService:
         """
         self.cache_dir = cache_dir
     
-    def _release_whisper_service(self, service: Any) -> None:
+    def _release_service(self, service: Any) -> None:
         """
-        释放 WhisperService 实例，清理 GPU 显存
+        Release a backend service and clear GPU memory.
         
         Args:
-            service: WhisperService 实例
+            service: backend service instance
         """
         try:
-            print(f"🧹 Releasing WhisperService instance...")
+            print(f"🧹 Releasing backend service instance...")
+
+            if hasattr(service, "release"):
+                service.release()
+                return
             
-            # 1. 释放 Whisper 模型
             if hasattr(service, 'model') and service.model is not None:
                 try:
                     import torch
-                    # 将模型移到 CPU（如果模型在 GPU 上）
                     if hasattr(service.model, 'to'):
                         service.model.to('cpu')
-                    # 删除模型引用
                     del service.model
-                    print(f"   ✅ Whisper model released")
+                    print(f"   ✅ Backend model released")
                 except Exception as e:
-                    print(f"   ⚠️ Error releasing Whisper model: {e}")
+                    print(f"   ⚠️ Error releasing backend model: {e}")
             
-            # 3. 清理 CUDA 缓存
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -86,15 +91,37 @@ class TranscriptionEndpointService:
             except Exception as e:
                 print(f"   ⚠️ Error clearing CUDA cache: {e}")
             
-            # 4. 删除服务实例引用
             del service
             
-            # 5. 强制垃圾回收
             gc.collect()
-            print(f"✅ WhisperService instance fully released")
+            print(f"✅ Backend service instance fully released")
             
         except Exception as e:
-            print(f"⚠️ Error during WhisperService release: {e}")
+            print(f"⚠️ Error during backend service release: {e}")
+
+    def _replace_backend(self, key: Tuple[str, str], service_factory: Any) -> Any:
+        global _cached_backend
+
+        if _cached_backend is not None and _cached_backend.key == key:
+            print(f"♻️ Reusing cached backend service: {key}")
+            return _cached_backend.service
+
+        with _cache_lock:
+            if _cached_backend is not None and _cached_backend.key == key:
+                print(f"♻️ Reusing cached backend service after lock: {key}")
+                return _cached_backend.service
+
+            if _cached_backend is not None:
+                print(f"🔄 Backend changed from {_cached_backend.key} to {key}, releasing old service...")
+                old_service = _cached_backend.service
+                _cached_backend = None
+                self._release_service(old_service)
+
+            print(f"🆕 Creating backend service: {key}")
+            service = service_factory()
+            _cached_backend = _CachedBackend(key=key, service=service)
+            print(f"✅ Backend service cached: {key}")
+            return service
     
     def _get_or_create_whisper_service(self, model_size: str) -> Any:
         """
@@ -108,42 +135,37 @@ class TranscriptionEndpointService:
         Returns:
             WhisperService 实例
         """
-        global _cached_whisper_service, _cached_model_size
-        
-        # 先检查缓存（不加锁，快速路径）
-        if _cached_whisper_service is not None and _cached_model_size == model_size:
-            print(f"♻️ Reusing cached WhisperService instance for model: {model_size}")
-            return _cached_whisper_service
-        
-        # 需要创建新实例时，使用锁保证线程安全
-        with _cache_lock:
-            # 双重检查：可能在等待锁时其他线程已经创建了实例
-            if _cached_whisper_service is not None and _cached_model_size == model_size:
-                print(f"♻️ Reusing cached WhisperService instance for model: {model_size} (after lock)")
-                return _cached_whisper_service
-            
-            # 如果 model_size 改变，需要释放旧实例
-            if _cached_whisper_service is not None and _cached_model_size != model_size:
-                print(f"🔄 Model size changed from {_cached_model_size} to {model_size}, releasing old instance...")
-                # 使用专门的释放方法清理旧实例
-                old_service = _cached_whisper_service
-                _cached_whisper_service = None  # 先清空缓存引用
-                _cached_model_size = None
-                self._release_whisper_service(old_service)
-            
-            # 创建新实例并缓存
-            print(f"🆕 Creating new WhisperService instance for model: {model_size}")
-            from .whisper_service import WhisperService
-            
-            service = WhisperService(
-                cache_dir=self.cache_dir,
-                model_size=model_size
-            )
-            
-            _cached_whisper_service = service
-            _cached_model_size = model_size
-            print(f"✅ WhisperService instance cached for model: {model_size}")
-            return service
+        return self._replace_backend(
+            ("whisper", model_size),
+            lambda: self._create_whisper_service(model_size),
+        )
+
+    def _create_whisper_service(self, model_size: str) -> Any:
+        from .whisper_service import WhisperService
+
+        return WhisperService(
+            cache_dir=self.cache_dir,
+            model_size=model_size,
+        )
+
+    def _get_or_create_qwen_service(self, asr_model_id: str) -> Any:
+        aligner_model_id = os.getenv(
+            "QWEN_FORCED_ALIGNER_MODEL_ID",
+            "Qwen/Qwen3-ForcedAligner-0.6B",
+        )
+        return self._replace_backend(
+            ("qwen3_asr", f"{asr_model_id}|{aligner_model_id}"),
+            lambda: self._create_qwen_service(asr_model_id, aligner_model_id),
+        )
+
+    def _create_qwen_service(self, asr_model_id: str, aligner_model_id: str) -> Any:
+        from .qwen_asr_service import QwenAsrService
+
+        return QwenAsrService(
+            cache_dir=self.cache_dir,
+            asr_model_id=asr_model_id,
+            aligner_model_id=aligner_model_id,
+        )
     
     def process_chunk_request(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -162,8 +184,17 @@ class TranscriptionEndpointService:
             # Extract request parameters
             audio_file_data = request_data.get("audio_file_data")
             audio_file_name = request_data.get("audio_file_name", "chunk.mp3")
-            # Get model_size from request, or use default from configuration
+            # Get model_size from request, or use default from configuration.
+            # model_size remains Whisper-only; Qwen uses asr_model_id.
             model_size = request_data.get("model_size") or os.getenv("DEFAULT_MODEL_SIZE", "large-v3")
+            asr_backend = str(
+                request_data.get("asr_backend")
+                or os.getenv("ASR_BACKEND", "whisper")
+            ).strip().lower()
+            asr_model_id = request_data.get("asr_model_id") or os.getenv(
+                "QWEN_ASR_MODEL_ID",
+                "Qwen/Qwen3-ASR-0.6B",
+            )
             language = request_data.get("language", "auto")  # Default to "auto" for automatic detection
             enable_speaker_diarization = request_data.get("enable_speaker_diarization", False)
             chunk_start_time = request_data.get("chunk_start_time", 0)
@@ -186,20 +217,33 @@ class TranscriptionEndpointService:
             write_file_bytes(str(temp_audio_path), audio_bytes)
             
             print(f"🎤 Processing chunk on server: {audio_file_name}")
+            print(f"   ASR backend: {asr_backend}")
             print(f"   Time range: {chunk_start_time:.2f}s - {chunk_end_time:.2f}s")
             print(f"   Size: {len(audio_bytes) / (1024*1024):.2f} MB")
             
             try:
-                # 使用缓存机制获取或创建 WhisperService 实例
-                # 这样可以避免每次请求都重新加载模型到 GPU 显存
-                service = self._get_or_create_whisper_service(model_size)
-                
-                result = service.transcribe_audio(
-                    audio_file_path=str(temp_audio_path),
-                    model_size=model_size,  # Use request model_size if provided, otherwise uses preloaded model
-                    language=language,
-                    enable_speaker_diarization=enable_speaker_diarization
-                )
+                if asr_backend == "qwen3_asr":
+                    result = self._transcribe_with_qwen_or_fallback(
+                        audio_file_path=str(temp_audio_path),
+                        asr_model_id=asr_model_id,
+                        model_size=model_size,
+                        language=language,
+                        enable_speaker_diarization=enable_speaker_diarization,
+                    )
+                elif asr_backend == "whisper":
+                    result = self._transcribe_with_whisper(
+                        audio_file_path=str(temp_audio_path),
+                        model_size=model_size,
+                        language=language,
+                        enable_speaker_diarization=enable_speaker_diarization,
+                    )
+                else:
+                    return {
+                        "processing_status": "failed",
+                        "error_message": f"Unknown asr_backend: {asr_backend}",
+                        "chunk_start_time": chunk_start_time,
+                        "chunk_end_time": chunk_end_time,
+                    }
                 
                 # Add chunk timing information
                 if result.get("processing_status") == "success":
@@ -269,3 +313,52 @@ class TranscriptionEndpointService:
                 "chunk_end_time": request_data.get("chunk_end_time", 0)
             }
 
+    def _transcribe_with_whisper(
+        self,
+        audio_file_path: str,
+        model_size: str,
+        language: Any,
+        enable_speaker_diarization: bool,
+    ) -> Dict[str, Any]:
+        service = self._get_or_create_whisper_service(model_size)
+        return service.transcribe_audio(
+            audio_file_path=audio_file_path,
+            model_size=model_size,
+            language=language,
+            enable_speaker_diarization=enable_speaker_diarization,
+        )
+
+    def _transcribe_with_qwen_or_fallback(
+        self,
+        audio_file_path: str,
+        asr_model_id: str,
+        model_size: str,
+        language: Any,
+        enable_speaker_diarization: bool,
+    ) -> Dict[str, Any]:
+        try:
+            from .qwen_asr_service import AlignerLanguageUnsupported
+
+            service = self._get_or_create_qwen_service(asr_model_id)
+            return service.transcribe_audio(
+                audio_file_path=audio_file_path,
+                language=language,
+                enable_speaker_diarization=enable_speaker_diarization,
+            )
+        except AlignerLanguageUnsupported as exc:
+            print(
+                "⚠️ Qwen3 ForcedAligner language unsupported; "
+                f"falling back to Whisper {model_size}: {exc}"
+            )
+            result = self._transcribe_with_whisper(
+                audio_file_path=audio_file_path,
+                model_size=model_size,
+                # The original language may be unsupported only by Qwen's
+                # aligner. Let Whisper auto-detect so fallback remains useful
+                # for real audio and for the unsupported-language smoke test.
+                language="auto",
+                enable_speaker_diarization=enable_speaker_diarization,
+            )
+            if result.get("processing_status") == "success":
+                result["model_used"] = f"qwen3_asr_fallback_whisper:{model_size}"
+            return result

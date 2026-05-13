@@ -30,12 +30,24 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
   - `MODAL_APP_NAME` (default `transcribe-modal-gpu`)
   - `MODAL_GPU_TYPE` (default `T4`)
   - `MODAL_CPU`, `MODAL_MEMORY`, `MODAL_GPU_TIMEOUT` etc.
+  - `ASR_BACKEND` (`whisper` by default; set `qwen3_asr` to use Qwen3-ASR)
+  - `QWEN_ASR_MODEL_ID` / `QWEN_FORCED_ALIGNER_MODEL_ID` for the Qwen3-ASR
+    transformers backend. ForcedAligner is mandatory on the Qwen path so SRT
+    timestamps keep the same contract as Whisper segments. T4 deployments use
+    FP16 automatically; newer GPUs use BF16 when supported.
+  - `QWEN_SUBTITLE_MAX_SECONDS` / `QWEN_SUBTITLE_MAX_CHARS` /
+    `QWEN_SUBTITLE_GAP_SECONDS` tune Qwen forced-align timestamp aggregation
+    into subtitle-sized segments (defaults `1.6` / `12` / `0.35`, tuned to a
+    Whisper-like subtitle cadence rather than raw word/character timestamps).
+    Qwen subtitles project punctuation from ASR `result.text` back onto
+    ForcedAligner timestamps before splitting, so boundaries prefer `。！？；，`
+    over hard character limits.
   - `PYANNOTE_SEGMENTATION_BATCH_SIZE` / `PYANNOTE_EMBEDDING_BATCH_SIZE` (default `128` / `128` in the service; community-1 config default is `32` / `32`)
   - `PYANNOTE_USE_MEMORY_INPUT` / `PYANNOTE_PROGRESS_HOOK` (default `true` / `true`)
 
 ## Hugging Face token (deploy-only, never user-facing)
 
-End users do **not** create or manage any Hugging Face Modal secret. The GPU image bakes pyannote weights at build time and runs fully offline (`HF_HUB_OFFLINE=1`); `secrets = []` on the runtime function, so nothing HF-related shows up in the user's Modal workspace `Secrets` list.
+End users do **not** create or manage any Hugging Face Modal secret. The GPU image bakes pyannote, Qwen3-ASR, and Qwen3-ForcedAligner weights at build time and runs fully offline (`HF_HUB_OFFLINE=1`); `secrets = []` on the runtime function, so nothing HF-related shows up in the user's Modal workspace `Secrets` list.
 
 There are two deploy paths and the token is supplied differently in each:
 
@@ -60,6 +72,21 @@ export HF_TOKEN=hf_your_token_here
 uv run modal deploy -m src.config.modal_gpu_config
 ```
 
+For an isolated Qwen3-ASR GPU direct-test deployment, keep the original app
+untouched and use a distinct Modal app name:
+
+```bash
+export HF_TOKEN=hf_your_token_here
+export MODAL_APP_NAME=transcribe-modal-gpu-qwen3-dev
+export MODAL_GPU_TYPE=T4
+export ASR_BACKEND=whisper
+export QWEN_ALIGNER_MAX_SEGMENT_SECONDS=180
+export QWEN_SUBTITLE_MAX_SECONDS=1.6
+export QWEN_SUBTITLE_MAX_CHARS=12
+export QWEN_SUBTITLE_GAP_SECONDS=0.35
+uv run modal deploy -m src.config.modal_gpu_config --name transcribe-modal-gpu-qwen3-dev
+```
+
 After deploy, the Modal dashboard lists `transcribe_and_diarization_audio_function` (no separate web URL). The **Secrets** tab in the user's workspace will not contain any HF entry — that is the intended state.
 
 ## Local test of the pure function (one-shot invocation)
@@ -68,3 +95,17 @@ After deploy, the Modal dashboard lists `transcribe_and_diarization_audio_functi
 uv run modal run src.config.modal_gpu_config::transcribe_and_diarization_audio_function \
   --request-data '{"request_type": "diarization", "audio_file_data": "<base64>", "audio_file_name": "test.mp3"}'
 ```
+
+## Qwen3-ASR direct comparison smoke test
+
+After deploying `transcribe-modal-gpu-qwen3-dev`, run the comparison script
+against the original Whisper app and the isolated Qwen app:
+
+```bash
+uv run python scripts/qwen3_gpu_direct_test.py
+```
+
+The script downloads the configured Apple Podcast sample, cuts 90s and 300s
+clips with ffmpeg, calls `transcribe_and_diarization_audio_function` on both
+apps, and writes JSON/text/SRT artifacts under
+`/tmp/qwen3-asr-smoke/apple-1000767368971/`.

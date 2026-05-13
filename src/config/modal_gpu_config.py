@@ -61,7 +61,13 @@ def _transcribe_and_diarization_audio_endpoint(request_data: dict):
     # If request_type is not explicitly set, infer from request data structure
     if not request_type:
         # Check for transcription-specific fields
-        if "chunk_start_time" in request_data or "chunk_end_time" in request_data or "model_size" in request_data:
+        if (
+            "chunk_start_time" in request_data
+            or "chunk_end_time" in request_data
+            or "model_size" in request_data
+            or "asr_backend" in request_data
+            or "asr_model_id" in request_data
+        ):
             request_type = "transcribe"
         else:
             # Default to diarization if no transcription-specific fields found
@@ -117,4 +123,3 @@ GPU_ENDPOINT_CONFIG = {
     "memory_mb": MODAL_GPU_MEMORY,
     "timeout_seconds": MODAL_GPU_TIMEOUT,
 }
-
