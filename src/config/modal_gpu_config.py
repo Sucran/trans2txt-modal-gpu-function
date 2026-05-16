@@ -95,6 +95,7 @@ def _transcribe_and_diarization_audio_endpoint(request_data: dict):
 
 # Pure Modal function for SDK .call() / .spawn() only (no HTTP; long work fits Modal timeouts, not request gateways)
 @app.function(
+    region=["ap"],
     image=transcription_image,
     volumes={cache_dir: volume},
     cpu=MODAL_GPU_CPU,
