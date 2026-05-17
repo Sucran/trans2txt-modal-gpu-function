@@ -11,7 +11,7 @@ import modal
 
 # `modal deploy` on this file loads it as a top-level module (not as `src.config.*`),
 # so `from .modal_shared` fails. Prefer imports from the repo root.
-_repo_root = Path(__file__).resolve().parents[1]
+_repo_root = Path(__file__).resolve().parents[2]
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
