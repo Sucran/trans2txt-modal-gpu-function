@@ -19,9 +19,9 @@ import ffmpeg
 
 
 MAX_ALIGNER_SEGMENT_SECONDS = int(os.getenv("QWEN_ALIGNER_MAX_SEGMENT_SECONDS", "60"))
-DEFAULT_SUBTITLE_MAX_SECONDS = 1.6
-DEFAULT_SUBTITLE_MAX_CHARS = 12
-DEFAULT_SUBTITLE_GAP_SECONDS = 0.35
+DEFAULT_SUBTITLE_MAX_SECONDS = 2.4
+DEFAULT_SUBTITLE_MAX_CHARS = 28
+DEFAULT_SUBTITLE_GAP_SECONDS = 0.50
 DEFAULT_VLLM_BATCH_SIZE = 4
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.70
 DEFAULT_VLLM_MAX_MODEL_LEN = 8192
@@ -589,8 +589,8 @@ class QwenAsrService:
             "gap_seconds": _read_env_float(
                 "QWEN_SUBTITLE_GAP_SECONDS", DEFAULT_SUBTITLE_GAP_SECONDS
             ),
-            "strategy": "punctuated_text_projection",
-            "schema_version": 2,
+            "strategy": "sentence_first_punctuated_text_projection",
+            "schema_version": 3,
         }
 
     def _aggregate_subtitle_segments(
@@ -652,18 +652,24 @@ class QwenAsrService:
             gap = max(0.0, start - current_end)
             candidate_duration = max(end, current_end) - current_start
             current_duration = current_end - current_start
-            hard_max_seconds = max(max_seconds * 2.0, max_seconds + 1.2)
-            hard_max_chars = max(max_chars * 2, max_chars + 8)
+            soft_clause_chars = max(18, int(max_chars * 0.75))
+            hard_max_seconds = max(max_seconds * 1.5, max_seconds + 0.8)
+            hard_max_chars = int(max(max_chars * 1.5, max_chars + 8))
             gap_break = gap >= gap_seconds and (
-                len(current_text) >= 4
+                len(current_text) >= 8
                 or _ends_sentence(current_text)
-                or _ends_clause(current_text)
                 or gap >= max(gap_seconds * 2.0, 0.75)
             )
             should_break = (
                 gap_break
                 or (_ends_sentence(current_text) and len(current_text) >= 4)
-                or (_ends_clause(current_text) and (len(current_text) >= 6 or current_duration >= 0.8))
+                or (
+                    _ends_clause(current_text)
+                    and (
+                        len(current_text) >= soft_clause_chars
+                        or current_duration >= max_seconds
+                    )
+                )
                 or (candidate_duration > hard_max_seconds and len(current_text) >= 4)
                 or (len(candidate_text) > hard_max_chars and len(current_text) >= 4)
             )

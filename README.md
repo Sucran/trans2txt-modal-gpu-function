@@ -62,8 +62,8 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
     the product layer knows episode/title-specific vocabulary.
   - `QWEN_SUBTITLE_MAX_SECONDS` / `QWEN_SUBTITLE_MAX_CHARS` /
     `QWEN_SUBTITLE_GAP_SECONDS` tune Qwen forced-align timestamp aggregation
-    into subtitle-sized segments (defaults `1.6` / `12` / `0.35`, tuned to a
-    Whisper-like subtitle cadence rather than raw word/character timestamps).
+    into subtitle-sized segments (defaults `2.4` / `28` / `0.50`, tuned to keep
+    short phrases readable without splitting Chinese proper nouns too eagerly).
     Qwen subtitles project punctuation from ASR `result.text` back onto
     ForcedAligner timestamps before splitting, so boundaries prefer `。！？；，`
     over hard character limits.
@@ -124,9 +124,9 @@ export PYANNOTE_SEGMENTATION_BATCH_SIZE=256
 export PYANNOTE_EMBEDDING_BATCH_SIZE=256
 export QWEN_ASR_CONTEXT=""
 export QWEN_ALIGNER_MAX_SEGMENT_SECONDS=60
-export QWEN_SUBTITLE_MAX_SECONDS=1.6
-export QWEN_SUBTITLE_MAX_CHARS=12
-export QWEN_SUBTITLE_GAP_SECONDS=0.35
+export QWEN_SUBTITLE_MAX_SECONDS=2.4
+export QWEN_SUBTITLE_MAX_CHARS=28
+export QWEN_SUBTITLE_GAP_SECONDS=0.50
 uv run modal deploy -m src.config.modal_gpu_config --name transcribe-modal-gpu-qwen3-l4-vllm
 ```
 

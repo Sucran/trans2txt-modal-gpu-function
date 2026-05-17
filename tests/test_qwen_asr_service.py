@@ -261,9 +261,31 @@ class QwenAsrServiceHelperTests(unittest.TestCase):
         texts = [segment["text"] for segment in segments]
 
         self.assertIn("五块，这不是特例哈。", texts)
-        self.assertIn("阿莫西林从六毛多一票降到两毛，", texts)
+        self.assertIn("阿莫西林从六毛多一票降到两毛，阿司匹林最便宜只要三分钱一票，", texts)
+        self.assertTrue(all(len(text) <= 32 for text in texts))
         self.assertFalse(any(text.endswith("阿莫") for text in texts))
         self.assertFalse(any(text.startswith("西林") for text in texts))
+
+    def test_punctuated_aggregation_splits_long_clause_at_comma(self) -> None:
+        service = object.__new__(qwen.QwenAsrService)
+        text = "今天我们先讲第一个问题，它不是一个孤立事件，而是一连串变化共同造成的结果，所以需要放在整个背景里看。"
+        raw_text = "".join(char for char in text if char not in qwen.ALIGNMENT_PUNCTUATION)
+        raw = [
+            {"start": i * 0.1, "end": i * 0.1 + 0.08, "text": char, "speaker": None}
+            for i, char in enumerate(raw_text)
+        ]
+
+        segments = service._aggregate_subtitle_segments(raw, text)
+        texts = [segment["text"] for segment in segments]
+
+        self.assertEqual(
+            texts,
+            [
+                "今天我们先讲第一个问题，它不是一个孤立事件，",
+                "而是一连串变化共同造成的结果，所以需要放在整个背景里看。",
+            ],
+        )
+        self.assertTrue(all(len(item) <= 32 for item in texts))
 
     def test_aggregate_english_alignment_segments_with_spaces(self) -> None:
         service = object.__new__(qwen.QwenAsrService)
