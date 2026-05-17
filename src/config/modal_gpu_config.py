@@ -25,7 +25,7 @@ from src.config.modal_shared import (
 )
 
 # GPU endpoint configuration from environment variables
-MODAL_GPU_TYPE = os.getenv("MODAL_GPU_TYPE", "T4")
+MODAL_GPU_TYPE = os.getenv("MODAL_GPU_TYPE", "L4")
 MODAL_GPU_CPU = int(os.getenv("MODAL_CPU", "4"))
 MODAL_GPU_MEMORY = int(os.getenv("MODAL_MEMORY", "8192"))  # Default 8GB
 MODAL_GPU_TIMEOUT = int(os.getenv("MODAL_GPU_TIMEOUT", "1800"))  # 30 minutes

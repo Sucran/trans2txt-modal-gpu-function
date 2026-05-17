@@ -28,7 +28,7 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
 - A Modal account and `modal token new` already run.
 - Environment variables (can be set via `config.env` in project root, see `config.env.example`):
   - `MODAL_APP_NAME` (default `transcribe-modal-gpu`)
-  - `MODAL_GPU_TYPE` (default `T4`)
+  - `MODAL_GPU_TYPE` (default `L4`)
   - `MODAL_CPU`, `MODAL_MEMORY`, `MODAL_GPU_TIMEOUT` etc.
     The GPU function does not pin a Modal region by default, so benchmark
     deployments avoid region selection premiums unless an operator adds one.
@@ -44,13 +44,12 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
     backend. The default ASR model is `Qwen/Qwen3-ASR-1.7B` for accuracy;
     `Qwen/Qwen3-ASR-0.6B` is the faster throughput-oriented option.
     ForcedAligner is mandatory on the Qwen path so SRT timestamps keep the same
-    contract as Whisper segments. T4 deployments use FP16 automatically; newer
-    GPUs use BF16 when supported.
-  - `QWEN_ASR_RUNTIME` selects `transformers` (default) or `vllm`. For the L4
-    benchmark profile, use `QWEN_ASR_RUNTIME=vllm`,
-    `QWEN_VLLM_DTYPE=bfloat16`, `QWEN_VLLM_BATCH_SIZE=4`, and
-    `QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70`; then tune batch size upward only
-    after the 90s/300s/1800s smoke runs pass.
+    contract as Whisper segments. The default L4 vLLM deployment uses BF16;
+    T4 deployments fall back to FP16 automatically.
+  - `QWEN_ASR_RUNTIME` selects `vllm` (default) or `transformers`. The default
+    L4 profile uses `QWEN_VLLM_DTYPE=bfloat16`, `QWEN_VLLM_BATCH_SIZE=4`, and
+    `QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70`; tune batch size upward only after
+    the 90s/300s/1800s smoke runs pass.
   - `QWEN_ALLOWED_ASR_MODEL_IDS` optionally allowlists request-level
     `asr_model_id` overrides. Blank means only the configured
     `QWEN_ASR_MODEL_ID` is accepted.
@@ -64,7 +63,9 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
     Qwen subtitles project punctuation from ASR `result.text` back onto
     ForcedAligner timestamps before splitting, so boundaries prefer `。！？；，`
     over hard character limits.
-  - `PYANNOTE_SEGMENTATION_BATCH_SIZE` / `PYANNOTE_EMBEDDING_BATCH_SIZE` (default `128` / `128` in the service; community-1 config default is `32` / `32`)
+  - `PYANNOTE_SEGMENTATION_BATCH_SIZE` / `PYANNOTE_EMBEDDING_BATCH_SIZE`
+    (default `256` / `256` in the service; community-1 config default is
+    `32` / `32`)
   - `PYANNOTE_USE_MEMORY_INPUT` / `PYANNOTE_PROGRESS_HOOK` (default `true` / `true`)
 
 ## Hugging Face token (deploy-only, never user-facing)
@@ -94,8 +95,8 @@ export HF_TOKEN=hf_your_token_here
 uv run modal deploy -m src.config.modal_gpu_config
 ```
 
-For an isolated Qwen3-ASR L4 + vLLM test deployment, keep the original app
-untouched and use a distinct Modal app name:
+The default deployment now runs Qwen3-ASR on L4 + vLLM. To keep the original
+app untouched during benchmarking, set a distinct Modal app name:
 
 ```bash
 export HF_TOKEN=hf_your_token_here
@@ -113,6 +114,8 @@ export QWEN_VLLM_DTYPE=bfloat16
 export QWEN_ALIGNER_DTYPE=
 export QWEN_VLLM_BATCH_SIZE=4
 export QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70
+export PYANNOTE_SEGMENTATION_BATCH_SIZE=256
+export PYANNOTE_EMBEDDING_BATCH_SIZE=256
 export QWEN_ASR_CONTEXT=""
 export QWEN_ALIGNER_MAX_SEGMENT_SECONDS=60
 export QWEN_SUBTITLE_MAX_SECONDS=1.6

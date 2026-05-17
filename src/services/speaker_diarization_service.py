@@ -55,13 +55,13 @@ class SpeakerDiarizationService:
             self._positive_int(request_data.get("segmentation_batch_size"))
             or self._positive_int(hints.get("segmentation_batch_size"))
             or self._positive_int(os.getenv("PYANNOTE_SEGMENTATION_BATCH_SIZE"))
-            or 128
+            or 256
         )
         embedding_batch_size = (
             self._positive_int(request_data.get("embedding_batch_size"))
             or self._positive_int(hints.get("embedding_batch_size"))
             or self._positive_int(os.getenv("PYANNOTE_EMBEDDING_BATCH_SIZE"))
-            or 128
+            or 256
         )
         return {
             "segmentation_batch_size": segmentation_batch_size,
