@@ -17,6 +17,10 @@ except ImportError:
     FFMPEG_AVAILABLE = False
 
 
+class DiarizationRuntimeError(Exception):
+    """Raised when speaker diarization cannot produce a reliable result."""
+
+
 class SpeakerDiarizationService:
     """Service for speaker diarization using pyannote.audio"""
     
@@ -150,8 +154,13 @@ class SpeakerDiarizationService:
             )
             return {"waveform": waveform, "sample_rate": sample_rate}
         except Exception as e:
-            print(f"⚠️ Failed to load audio into memory, falling back to file path: {e}")
-            return audio_file_path
+            message = (
+                "Failed to preload diarization audio into memory with soundfile "
+                f"or torchaudio; refusing file-path decoding because pyannote's "
+                f"torchcodec path may be unavailable. torchaudio error: {e}"
+            )
+            print(f"❌ {message}")
+            raise DiarizationRuntimeError(message) from e
     
     def _load_pipeline(self):
         """
@@ -304,6 +313,9 @@ class SpeakerDiarizationService:
             }
         """
         temp_file = None
+        temp_file_path = None
+        preprocessed_path = None
+        preprocessed_file_created = False
         try:
             # 1. 解码 base64 音频数据
             audio_file_data = request_data.get("audio_file_data")
@@ -409,9 +421,19 @@ class SpeakerDiarizationService:
             traceback.print_exc()
             
             # 清理临时文件
-            if temp_file and os.path.exists(temp_file.name):
+            for path in (temp_file_path or (temp_file.name if temp_file else None),):
+                if path and os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except Exception:
+                        pass
+            if (
+                preprocessed_file_created
+                and preprocessed_path
+                and os.path.exists(preprocessed_path)
+            ):
                 try:
-                    os.unlink(temp_file.name)
+                    os.unlink(preprocessed_path)
                 except Exception:
                     pass
             
@@ -441,8 +463,7 @@ class SpeakerDiarizationService:
             # 1. 加载 pipeline（lazy loading）
             pipeline = self._load_pipeline()
             if pipeline is None:
-                print("⚠️ Pipeline not available, returning empty segments")
-                return []
+                raise DiarizationRuntimeError("Speaker diarization pipeline is unavailable")
             
             # 检查文件是否存在
             if not os.path.exists(audio_file_path):
@@ -501,4 +522,6 @@ class SpeakerDiarizationService:
             print(f"❌ Error in diarize_audio: {e}")
             import traceback
             traceback.print_exc()
-            return []
+            if isinstance(e, DiarizationRuntimeError):
+                raise
+            raise DiarizationRuntimeError(f"Speaker diarization failed: {e}") from e

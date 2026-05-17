@@ -6,6 +6,7 @@ import os
 import sys
 import types
 import unittest
+import base64
 from pathlib import Path
 from unittest import mock
 
@@ -14,7 +15,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.services.speaker_diarization_service import SpeakerDiarizationService  # noqa: E402
+from src.services.speaker_diarization_service import (  # noqa: E402
+    DiarizationRuntimeError,
+    SpeakerDiarizationService,
+)
 
 
 class SpeakerDiarizationServiceHelperTests(unittest.TestCase):
@@ -87,6 +91,51 @@ class SpeakerDiarizationServiceHelperTests(unittest.TestCase):
 
         self.assertEqual(payload["sample_rate"], 16000)
         self.assertEqual(payload["waveform"].shape, (1, 3))
+
+    def test_pipeline_audio_input_raises_when_memory_preload_fails(self) -> None:
+        service = SpeakerDiarizationService()
+        fake_soundfile = types.SimpleNamespace(
+            read=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("sf boom"))
+        )
+        fake_torch = types.SimpleNamespace(from_numpy=lambda array: array)
+        fake_torchaudio = types.SimpleNamespace(
+            load=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("tc boom"))
+        )
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "soundfile": fake_soundfile,
+                "torch": fake_torch,
+                "torchaudio": fake_torchaudio,
+            },
+            clear=False,
+        ):
+            with self.assertRaises(DiarizationRuntimeError):
+                service._pipeline_audio_input("/tmp/audio.wav")
+
+    def test_process_diarization_request_reports_runtime_failure(self) -> None:
+        service = SpeakerDiarizationService()
+        request = {
+            "audio_file_data": base64.b64encode(b"fake audio").decode("ascii"),
+            "audio_file_name": "audio.mp3",
+        }
+
+        with mock.patch.object(
+            service,
+            "_preprocess_audio_for_diarization",
+            side_effect=lambda path: path,
+        ):
+            with mock.patch.object(service, "_load_pipeline", return_value=object()):
+                with mock.patch.object(
+                    service,
+                    "diarize_audio",
+                    side_effect=DiarizationRuntimeError("pyannote failed"),
+                ):
+                    result = service.process_diarization_request(request)
+
+        self.assertEqual(result["processing_status"], "failed")
+        self.assertIn("pyannote failed", result["error_message"])
 
 
 if __name__ == "__main__":  # pragma: no cover
