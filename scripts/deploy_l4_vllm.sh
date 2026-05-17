@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${HF_TOKEN:-}" && -z "${HUGGING_FACE_TOKEN:-}" ]]; then
+  echo "HF_TOKEN or HUGGING_FACE_TOKEN is required for the build-time model cache step." >&2
+  exit 1
+fi
+
+export MODAL_APP_NAME="${MODAL_APP_NAME:-transcribe-modal-gpu-qwen3-l4-vllm}"
+export MODAL_GPU_TYPE="${MODAL_GPU_TYPE:-L4}"
+export MODAL_CPU="${MODAL_CPU:-4}"
+export MODAL_MEMORY="${MODAL_MEMORY:-8192}"
+export MODAL_GPU_TIMEOUT="${MODAL_GPU_TIMEOUT:-1800}"
+export MODEL_DOWNLOAD_RETRIES="${MODEL_DOWNLOAD_RETRIES:-4}"
+export MODEL_DOWNLOAD_RETRY_DELAY_SECONDS="${MODEL_DOWNLOAD_RETRY_DELAY_SECONDS:-20}"
+
+export ASR_BACKEND="${ASR_BACKEND:-whisper}"
+export QWEN_ASR_MODEL_ID="${QWEN_ASR_MODEL_ID:-Qwen/Qwen3-ASR-1.7B}"
+export QWEN_ALLOWED_ASR_MODEL_IDS="${QWEN_ALLOWED_ASR_MODEL_IDS:-}"
+export QWEN_FORCED_ALIGNER_MODEL_ID="${QWEN_FORCED_ALIGNER_MODEL_ID:-Qwen/Qwen3-ForcedAligner-0.6B}"
+
+export QWEN_ASR_RUNTIME="${QWEN_ASR_RUNTIME:-vllm}"
+export QWEN_VLLM_DTYPE="${QWEN_VLLM_DTYPE:-bfloat16}"
+export QWEN_ALIGNER_DTYPE="${QWEN_ALIGNER_DTYPE:-}"
+export QWEN_VLLM_BATCH_SIZE="${QWEN_VLLM_BATCH_SIZE:-4}"
+export QWEN_VLLM_GPU_MEMORY_UTILIZATION="${QWEN_VLLM_GPU_MEMORY_UTILIZATION:-0.70}"
+export QWEN_VLLM_MAX_MODEL_LEN="${QWEN_VLLM_MAX_MODEL_LEN:-}"
+
+uv run modal deploy -m src.config.modal_gpu_config --name "${MODAL_APP_NAME}"

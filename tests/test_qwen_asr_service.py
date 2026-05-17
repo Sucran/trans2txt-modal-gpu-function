@@ -84,6 +84,9 @@ class _FakeQwenModel:
 
     def transcribe(self, **kwargs: object) -> list[str]:
         self.calls.append(kwargs)
+        audio = kwargs.get("audio")
+        if isinstance(audio, list):
+            return [f"ok-{index}" for index, _item in enumerate(audio)]
         return ["ok"]
 
 
@@ -93,6 +96,17 @@ class QwenAsrServiceHelperTests(unittest.TestCase):
 
     def test_dtype_auto_uses_bf16_when_supported(self) -> None:
         self.assertEqual(qwen._select_torch_dtype(_FakeTorch(True, True)), "bf16")
+
+    def test_explicit_bf16_falls_back_to_fp16_when_not_supported(self) -> None:
+        self.assertEqual(
+            qwen._resolve_torch_dtype_name(_FakeTorch(True, False), "bfloat16"),
+            "float16",
+        )
+
+    def test_qwen_runtime_normalisation(self) -> None:
+        self.assertEqual(qwen._normalise_qwen_runtime("vllm"), "vllm")
+        self.assertEqual(qwen._normalise_qwen_runtime("VLLM"), "vllm")
+        self.assertEqual(qwen._normalise_qwen_runtime("unknown"), "transformers")
 
     def test_language_aliases_gate_aligner_support(self) -> None:
         self.assertEqual(qwen._normalise_language("zh-CN"), "Chinese")
@@ -110,6 +124,46 @@ class QwenAsrServiceHelperTests(unittest.TestCase):
         self.assertEqual(fake_model.calls[0]["context"], "CFO 陈震")
         self.assertEqual(fake_model.calls[0]["language"], "Chinese")
         self.assertTrue(fake_model.calls[0]["return_time_stamps"])
+
+    def test_transcribe_many_forwards_batch_inputs_to_qwen_model(self) -> None:
+        service = object.__new__(qwen.QwenAsrService)
+        fake_model = _FakeQwenModel()
+        service.model = fake_model
+
+        result = service._transcribe_many(["/tmp/a.mp3", "/tmp/b.mp3"], "Chinese", "CFO 陈震")
+
+        self.assertEqual(result, ["ok-0", "ok-1"])
+        self.assertEqual(fake_model.calls[0]["audio"], ["/tmp/a.mp3", "/tmp/b.mp3"])
+        self.assertEqual(fake_model.calls[0]["context"], ["CFO 陈震", "CFO 陈震"])
+        self.assertEqual(fake_model.calls[0]["language"], ["Chinese", "Chinese"])
+        self.assertTrue(fake_model.calls[0]["return_time_stamps"])
+
+    def test_vllm_batches_aligner_inputs(self) -> None:
+        service = object.__new__(qwen.QwenAsrService)
+        service.runtime = "vllm"
+        service.inference_batch_size = 2
+        inputs = [
+            ("/tmp/a.wav", 0.0, 60.0),
+            ("/tmp/b.wav", 60.0, 120.0),
+            ("/tmp/c.wav", 120.0, 180.0),
+        ]
+
+        batches = list(service._iter_transcription_batches(inputs))
+
+        self.assertEqual(batches, [inputs[:2], inputs[2:]])
+
+    def test_transformers_forces_single_item_batches(self) -> None:
+        service = object.__new__(qwen.QwenAsrService)
+        service.runtime = "transformers"
+        service.inference_batch_size = 8
+        inputs = [
+            ("/tmp/a.wav", 0.0, 60.0),
+            ("/tmp/b.wav", 60.0, 120.0),
+        ]
+
+        batches = list(service._iter_transcription_batches(inputs))
+
+        self.assertEqual(batches, [[inputs[0]], [inputs[1]]])
 
     def test_parse_time_stamps_accepts_tuples_dicts_and_objects(self) -> None:
         service = object.__new__(qwen.QwenAsrService)

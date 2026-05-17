@@ -22,6 +22,8 @@ MAX_ALIGNER_SEGMENT_SECONDS = int(os.getenv("QWEN_ALIGNER_MAX_SEGMENT_SECONDS", 
 DEFAULT_SUBTITLE_MAX_SECONDS = 1.6
 DEFAULT_SUBTITLE_MAX_CHARS = 12
 DEFAULT_SUBTITLE_GAP_SECONDS = 0.35
+DEFAULT_VLLM_BATCH_SIZE = 4
+DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.70
 
 SENTENCE_ENDING_PUNCTUATION = set(".!?。！？…")
 CLAUSE_ENDING_PUNCTUATION = set(",;:，；：、")
@@ -137,6 +139,60 @@ def _read_env_int(name: str, default: int) -> int:
     return value if value > 0 else int(default)
 
 
+def _normalise_qwen_runtime(runtime: Optional[str]) -> str:
+    value = str(runtime or "transformers").strip().lower().replace("-", "_")
+    return "vllm" if value == "vllm" else "transformers"
+
+
+def _cuda_supports_bf16(torch_module: Any) -> bool:
+    try:
+        cuda = getattr(torch_module, "cuda", None)
+        return bool(
+            cuda
+            and cuda.is_available()
+            and hasattr(cuda, "is_bf16_supported")
+            and cuda.is_bf16_supported()
+        )
+    except Exception:
+        return False
+
+
+def _select_torch_dtype_name(torch_module: Any) -> str:
+    return "bfloat16" if _cuda_supports_bf16(torch_module) else "float16"
+
+
+def _resolve_torch_dtype_name(
+    torch_module: Any,
+    raw_value: Optional[str],
+    default: str = "auto",
+) -> str:
+    raw = str(raw_value or default or "auto").strip().lower()
+    aliases = {
+        "auto": "auto",
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+        "fp16": "float16",
+        "float16": "float16",
+        "half": "float16",
+    }
+    value = aliases.get(raw, aliases.get(str(default).strip().lower(), "auto"))
+    if value == "auto":
+        return _select_torch_dtype_name(torch_module)
+    if value == "bfloat16" and not _cuda_supports_bf16(torch_module):
+        print(
+            "⚠️ Requested bfloat16 but CUDA device does not support BF16; "
+            "falling back to float16"
+        )
+        return "float16"
+    return value
+
+
+def _torch_dtype_from_name(torch_module: Any, dtype_name: str) -> Any:
+    if dtype_name == "bfloat16":
+        return torch_module.bfloat16
+    return torch_module.float16
+
+
 def _contains_cjk(text: str) -> bool:
     return any(
         "\u3400" <= char <= "\u9fff"
@@ -186,21 +242,11 @@ def _select_torch_dtype(torch_module: Any) -> Any:
     there instead of hard-coding BF16.
     """
 
-    try:
-        cuda = getattr(torch_module, "cuda", None)
-        is_available = bool(cuda and cuda.is_available())
-        supports_bf16 = bool(
-            is_available
-            and hasattr(cuda, "is_bf16_supported")
-            and cuda.is_bf16_supported()
-        )
-    except Exception:
-        supports_bf16 = False
-    return torch_module.bfloat16 if supports_bf16 else torch_module.float16
+    return _torch_dtype_from_name(torch_module, _select_torch_dtype_name(torch_module))
 
 
 class QwenAsrService:
-    """Qwen3-ASR transformers backend with mandatory ForcedAligner timestamps."""
+    """Qwen3-ASR backend with mandatory ForcedAligner timestamps."""
 
     def __init__(
         self,
@@ -211,19 +257,35 @@ class QwenAsrService:
         self.cache_dir = cache_dir
         self.asr_model_id = asr_model_id
         self.aligner_model_id = aligner_model_id
+        self.runtime = _normalise_qwen_runtime(
+            os.getenv("QWEN_ASR_RUNTIME", "transformers")
+        )
+        self.inference_batch_size = self._configured_inference_batch_size()
         print(
             "🔄 Preloading Qwen3-ASR model "
-            f"({asr_model_id}) with ForcedAligner ({aligner_model_id})..."
+            f"({asr_model_id}) runtime={self.runtime} "
+            f"batch={self.inference_batch_size} "
+            f"with ForcedAligner ({aligner_model_id})..."
         )
         self.model = self._load_model()
         print("✅ Qwen3-ASR + ForcedAligner preloaded successfully")
 
+    def _configured_inference_batch_size(self) -> int:
+        if self.runtime == "vllm":
+            return _read_env_int("QWEN_VLLM_BATCH_SIZE", DEFAULT_VLLM_BATCH_SIZE)
+        return _read_env_int("QWEN_TRANSFORMERS_BATCH_SIZE", 1)
+
     def _load_model(self) -> Any:
+        if self.runtime == "vllm":
+            return self._load_vllm_model()
+        return self._load_transformers_model()
+
+    def _load_transformers_model(self) -> Any:
         import torch
         from qwen_asr import Qwen3ASRModel
 
         dtype = _select_torch_dtype(torch)
-        print(f"   Qwen3-ASR dtype selected: {dtype}")
+        print(f"   Qwen3-ASR transformers dtype selected: {dtype}")
         return Qwen3ASRModel.from_pretrained(
             self.asr_model_id,
             dtype=dtype,
@@ -233,8 +295,53 @@ class QwenAsrService:
                 "dtype": dtype,
                 "device_map": "cuda:0",
             },
-            max_inference_batch_size=1,
+            max_inference_batch_size=self.inference_batch_size,
             max_new_tokens=int(os.getenv("QWEN_MAX_NEW_TOKENS", "1024")),
+        )
+
+    def _load_vllm_model(self) -> Any:
+        import torch
+        from qwen_asr import Qwen3ASRModel
+
+        dtype_name = _resolve_torch_dtype_name(
+            torch,
+            os.getenv("QWEN_VLLM_DTYPE"),
+            default="bfloat16",
+        )
+        aligner_dtype_name = _resolve_torch_dtype_name(
+            torch,
+            os.getenv("QWEN_ALIGNER_DTYPE"),
+            default=dtype_name,
+        )
+        aligner_dtype = _torch_dtype_from_name(torch, aligner_dtype_name)
+        gpu_memory_utilization = _read_env_float(
+            "QWEN_VLLM_GPU_MEMORY_UTILIZATION",
+            DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
+        )
+        kwargs: Dict[str, Any] = {
+            "dtype": dtype_name,
+            "gpu_memory_utilization": gpu_memory_utilization,
+        }
+        max_model_len = _read_env_int("QWEN_VLLM_MAX_MODEL_LEN", 0)
+        if max_model_len > 0:
+            kwargs["max_model_len"] = max_model_len
+
+        print(
+            "   Qwen3-ASR vLLM config: "
+            f"dtype={dtype_name}, aligner_dtype={aligner_dtype_name}, "
+            f"gpu_memory_utilization={gpu_memory_utilization}, "
+            f"batch={self.inference_batch_size}"
+        )
+        return Qwen3ASRModel.LLM(
+            model=self.asr_model_id,
+            forced_aligner=self.aligner_model_id,
+            forced_aligner_kwargs={
+                "dtype": aligner_dtype,
+                "device_map": "cuda:0",
+            },
+            max_inference_batch_size=self.inference_batch_size,
+            max_new_tokens=int(os.getenv("QWEN_MAX_NEW_TOKENS", "1024")),
+            **kwargs,
         )
 
     def transcribe_audio(
@@ -267,25 +374,36 @@ class QwenAsrService:
             languages: List[str] = []
 
             with tempfile.TemporaryDirectory(prefix="qwen_asr_", dir=self.cache_dir) as tmp_dir:
-                for sub_path, sub_start, _sub_end in self._iter_aligner_inputs(
-                    audio_file_path, duration, tmp_dir
-                ):
-                    result = self._transcribe_one(sub_path, requested_language, context_text)
-                    detected_language = str(getattr(result, "language", "") or "unknown")
-                    if not _is_aligner_language(_normalise_language(detected_language)):
-                        raise AlignerLanguageUnsupported(
-                            f"Qwen3-ForcedAligner does not support detected language: {detected_language}"
+                aligner_inputs = list(
+                    self._iter_aligner_inputs(audio_file_path, duration, tmp_dir)
+                )
+                for batch in self._iter_transcription_batches(aligner_inputs):
+                    paths = [item[0] for item in batch]
+                    results = self._transcribe_many(paths, requested_language, context_text)
+                    if len(results) != len(batch):
+                        raise QwenTimestampParseError(
+                            "Qwen3-ASR result count did not match input batch size"
                         )
 
-                    text = str(getattr(result, "text", "") or "").strip()
-                    if text:
-                        texts.append(text)
-                    if detected_language and detected_language != "unknown":
-                        languages.append(detected_language)
+                    for result, (_sub_path, sub_start, _sub_end) in zip(results, batch):
+                        detected_language = str(getattr(result, "language", "") or "unknown")
+                        if not _is_aligner_language(_normalise_language(detected_language)):
+                            raise AlignerLanguageUnsupported(
+                                f"Qwen3-ForcedAligner does not support detected language: {detected_language}"
+                            )
 
-                    raw_segments.extend(
-                        self._parse_time_stamps(getattr(result, "time_stamps", None), sub_start)
-                    )
+                        text = str(getattr(result, "text", "") or "").strip()
+                        if text:
+                            texts.append(text)
+                        if detected_language and detected_language != "unknown":
+                            languages.append(detected_language)
+
+                        raw_segments.extend(
+                            self._parse_time_stamps(
+                                getattr(result, "time_stamps", None),
+                                sub_start,
+                            )
+                        )
 
             if not raw_segments:
                 raise QwenTimestampParseError("Qwen3-ASR returned no timestamped segments")
@@ -307,6 +425,8 @@ class QwenAsrService:
 
             return {
                 "model_used": f"qwen3_asr:{self.asr_model_id}",
+                "qwen_asr_runtime": self.runtime,
+                "qwen_inference_batch_size": self.inference_batch_size,
                 "segment_count": len(segments),
                 "raw_segment_count": len(raw_segments),
                 "audio_duration": audio_duration,
@@ -328,6 +448,8 @@ class QwenAsrService:
             print(f"❌ Qwen3-ASR transcription failed: {exc}")
             return {
                 "model_used": f"qwen3_asr:{self.asr_model_id}",
+                "qwen_asr_runtime": getattr(self, "runtime", "unknown"),
+                "qwen_inference_batch_size": getattr(self, "inference_batch_size", 0),
                 "segment_count": 0,
                 "audio_duration": 0,
                 "processing_status": "failed",
@@ -356,6 +478,33 @@ class QwenAsrService:
         if not results:
             raise QwenTimestampParseError("Qwen3-ASR returned an empty result list")
         return results[0]
+
+    def _transcribe_many(
+        self,
+        audio_paths: List[str],
+        language: Optional[str],
+        context: Optional[str],
+    ) -> List[Any]:
+        if len(audio_paths) == 1:
+            return [self._transcribe_one(audio_paths[0], language, context)]
+
+        try:
+            context_text = _normalise_context(context)
+            results = self.model.transcribe(
+                audio=audio_paths,
+                context=[context_text] * len(audio_paths),
+                language=[language] * len(audio_paths),
+                return_time_stamps=True,
+            )
+        except Exception as exc:
+            message = str(exc).lower()
+            if "language" in message and ("support" in message or "unsupported" in message):
+                raise AlignerLanguageUnsupported(str(exc)) from exc
+            raise
+
+        if not results:
+            raise QwenTimestampParseError("Qwen3-ASR returned an empty batch result")
+        return list(results)
 
     def _parse_time_stamps(
         self,
@@ -609,6 +758,16 @@ class QwenAsrService:
                 .run(quiet=True)
             )
             yield sub_path, start, end
+
+    def _iter_transcription_batches(
+        self,
+        inputs: List[Tuple[str, float, float]],
+    ) -> Iterable[List[Tuple[str, float, float]]]:
+        batch_size = max(1, int(getattr(self, "inference_batch_size", 1) or 1))
+        if getattr(self, "runtime", "transformers") != "vllm":
+            batch_size = 1
+        for start in range(0, len(inputs), batch_size):
+            yield inputs[start : start + batch_size]
 
     def _probe_duration(self, audio_file_path: str) -> float:
         try:

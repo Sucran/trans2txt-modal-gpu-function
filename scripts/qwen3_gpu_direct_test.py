@@ -3,7 +3,8 @@
 
 This intentionally bypasses the CPU orchestrator and product app. It downloads a
 real Apple Podcast sample, cuts deterministic clips, calls the original GPU app
-and the isolated Qwen3 dev GPU app, then writes comparison artifacts under /tmp.
+and the isolated Qwen3 L4/vLLM GPU app, then writes comparison artifacts under
+/tmp.
 """
 
 from __future__ import annotations
@@ -28,10 +29,22 @@ DEFAULT_APPLE_URL = (
 )
 DEFAULT_OUTPUT_DIR = Path("/tmp/qwen3-asr-smoke/apple-1000767368971")
 DEFAULT_OLD_APP = "transcribe-modal-gpu"
-DEFAULT_NEW_APP = "transcribe-modal-gpu-qwen3-dev"
+DEFAULT_NEW_APP = "transcribe-modal-gpu-qwen3-l4-vllm"
 FUNCTION_NAME = "transcribe_and_diarization_audio_function"
 QWEN_PROTECTED_TERMS = ("阿莫西林", "阿司匹林", "布洛芬")
 PUNCTUATION_CHARS = set("，。！？；：、,.!?;:")
+
+MODAL_GPU_PRICE_PER_SECOND = {
+    "T4": 0.000164,
+    "L4": 0.000222,
+    "A10": 0.000306,
+    "L40S": 0.000542,
+    "A100-40GB": 0.000583,
+    "A100-80GB": 0.000694,
+    "H100": 0.001097,
+}
+MODAL_CPU_PRICE_PER_SECOND = 0.0000131
+MODAL_MEMORY_GIB_PRICE_PER_SECOND = 0.00000222
 
 
 def _log(message: str) -> None:
@@ -147,6 +160,49 @@ def write_srt(result: Dict[str, Any], path: Path) -> None:
             index += 1
 
 
+def modal_second_price(gpu_type: str, cpu_count: float, memory_gib: float) -> float:
+    normalized_gpu = str(gpu_type or "").strip().upper()
+    if normalized_gpu not in MODAL_GPU_PRICE_PER_SECOND:
+        raise RuntimeError(
+            f"Unknown GPU type for cost estimate: {gpu_type!r}. "
+            f"Known: {', '.join(sorted(MODAL_GPU_PRICE_PER_SECOND))}"
+        )
+    return (
+        MODAL_GPU_PRICE_PER_SECOND[normalized_gpu]
+        + float(cpu_count) * MODAL_CPU_PRICE_PER_SECOND
+        + float(memory_gib) * MODAL_MEMORY_GIB_PRICE_PER_SECOND
+    )
+
+
+def attach_benchmark_metrics(
+    result: Dict[str, Any],
+    *,
+    clip_seconds: int,
+    gpu_type: str,
+    cpu_count: float,
+    memory_gib: float,
+    region_multiplier: float,
+) -> None:
+    elapsed = float(result.get("_elapsed_seconds") or 0.0)
+    per_second = modal_second_price(gpu_type, cpu_count, memory_gib) * region_multiplier
+    result["_benchmark"] = {
+        "audio_seconds": clip_seconds,
+        "elapsed_seconds": elapsed,
+        "audio_seconds_per_processing_second": (
+            clip_seconds / elapsed if elapsed > 0 else 0.0
+        ),
+        "modal_cost_usd": elapsed * per_second,
+        "modal_price_per_second_usd": per_second,
+        "gpu_type": str(gpu_type).strip().upper(),
+        "cpu_count": cpu_count,
+        "memory_gib": memory_gib,
+        "region_multiplier": region_multiplier,
+        "oom_detected": "out of memory" in str(result.get("error_message") or "").lower()
+        or "cuda oom" in str(result.get("error_message") or "").lower()
+        or "oom" in str(result.get("error_message") or "").lower(),
+    }
+
+
 def build_payload(clip_path: Path, clip_seconds: int, case: Dict[str, Any]) -> Dict[str, Any]:
     audio_b64 = base64.b64encode(clip_path.read_bytes()).decode("ascii")
     payload: Dict[str, Any] = {
@@ -252,19 +308,27 @@ def validate_result(name: str, clip_seconds: int, result: Dict[str, Any]) -> Lis
     return issues
 
 
-def comparison_cases(old_app: str, new_app: str, qwen_context: str = "") -> List[Dict[str, Any]]:
+def comparison_cases(
+    old_app: str,
+    new_app: str,
+    qwen_context: str = "",
+    old_cost_gpu: str = "T4",
+    new_cost_gpu: str = "L4",
+) -> List[Dict[str, Any]]:
     return [
         {
             "name": "old_whisper",
             "app": old_app,
             "asr_backend": "whisper",
             "language": "auto",
+            "cost_gpu": old_cost_gpu,
         },
         {
             "name": "new_whisper",
             "app": new_app,
             "asr_backend": "whisper",
             "language": "auto",
+            "cost_gpu": new_cost_gpu,
         },
         {
             "name": "new_qwen3",
@@ -272,12 +336,14 @@ def comparison_cases(old_app: str, new_app: str, qwen_context: str = "") -> List
             "asr_backend": "qwen3_asr",
             "language": "auto",
             "qwen_context": qwen_context,
+            "cost_gpu": new_cost_gpu,
         },
         {
             "name": "fallback",
             "app": new_app,
             "asr_backend": "qwen3_asr",
             "language": "th",
+            "cost_gpu": new_cost_gpu,
         },
     ]
 
@@ -286,6 +352,7 @@ def selected_clips(output_dir: Path, names: Iterable[str]) -> Dict[str, tuple[Pa
     all_clips = {
         "smoke": (output_dir / "clips" / "smoke_90s.mp3", 90),
         "long": (output_dir / "clips" / "long_300s.mp3", 300),
+        "stress": (output_dir / "clips" / "stress_1800s.mp3", 1800),
     }
     return {name: all_clips[name] for name in names}
 
@@ -299,8 +366,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--new-app", default=os.getenv("NEW_GPU_APP_NAME", DEFAULT_NEW_APP))
     parser.add_argument(
         "--clips",
-        default="smoke,long",
-        help="Comma-separated clip names: smoke,long",
+        default="smoke,long,stress",
+        help="Comma-separated clip names: smoke,long,stress",
     )
     parser.add_argument(
         "--cases",
@@ -316,6 +383,34 @@ def parse_args() -> argparse.Namespace:
         "--qwen-context",
         default=os.getenv("QWEN_ASR_CONTEXT", ""),
         help="Optional Qwen3-ASR context hints for proper nouns/acronyms.",
+    )
+    parser.add_argument(
+        "--old-cost-gpu",
+        default=os.getenv("OLD_COST_GPU", "T4"),
+        help="GPU type used for old-app Modal cost estimates.",
+    )
+    parser.add_argument(
+        "--new-cost-gpu",
+        default=os.getenv("NEW_COST_GPU", "L4"),
+        help="GPU type used for new-app Modal cost estimates.",
+    )
+    parser.add_argument(
+        "--cost-cpu-count",
+        type=float,
+        default=float(os.getenv("MODAL_CPU", "4")),
+        help="CPU count used for Modal cost estimates.",
+    )
+    parser.add_argument(
+        "--cost-memory-gib",
+        type=float,
+        default=float(os.getenv("MODAL_MEMORY", "8192")) / 1024.0,
+        help="Memory GiB used for Modal cost estimates.",
+    )
+    parser.add_argument(
+        "--region-multiplier",
+        type=float,
+        default=float(os.getenv("MODAL_REGION_PRICE_MULTIPLIER", "1.0")),
+        help="Modal region price multiplier. Use 1.0 when the GPU function has no region pin.",
     )
     return parser.parse_args()
 
@@ -345,7 +440,13 @@ def main() -> int:
 
     allowed_cases = {
         case["name"]: case
-        for case in comparison_cases(args.old_app, args.new_app, args.qwen_context)
+        for case in comparison_cases(
+            args.old_app,
+            args.new_app,
+            args.qwen_context,
+            old_cost_gpu=args.old_cost_gpu,
+            new_cost_gpu=args.new_cost_gpu,
+        )
     }
     case_names = [item.strip() for item in args.cases.split(",") if item.strip()]
     cases = [allowed_cases[name] for name in case_names]
@@ -357,6 +458,16 @@ def main() -> int:
         "new_app": args.new_app,
         "qwen_context_enabled": bool(args.qwen_context.strip()),
         "qwen_context_length": len(args.qwen_context.strip()),
+        "cost_model": {
+            "gpu_prices_per_second": MODAL_GPU_PRICE_PER_SECOND,
+            "cpu_price_per_second": MODAL_CPU_PRICE_PER_SECOND,
+            "memory_gib_price_per_second": MODAL_MEMORY_GIB_PRICE_PER_SECOND,
+            "old_cost_gpu": args.old_cost_gpu,
+            "new_cost_gpu": args.new_cost_gpu,
+            "cpu_count": args.cost_cpu_count,
+            "memory_gib": args.cost_memory_gib,
+            "region_multiplier": args.region_multiplier,
+        },
         "clips": {},
         "issues": [],
     }
@@ -374,6 +485,14 @@ def main() -> int:
             _log(f"Calling {full_name}: app={case['app']} backend={case.get('asr_backend')}")
             payload = build_payload(clip_path, clip_seconds, case)
             result = call_modal(case["app"], payload)
+            attach_benchmark_metrics(
+                result,
+                clip_seconds=clip_seconds,
+                gpu_type=case.get("cost_gpu", args.new_cost_gpu),
+                cpu_count=args.cost_cpu_count,
+                memory_gib=args.cost_memory_gib,
+                region_multiplier=args.region_multiplier,
+            )
             clip_result["cases"][case_name] = result
 
             case_dir = output_dir / "artifacts" / clip_name / case_name
@@ -394,11 +513,14 @@ def main() -> int:
                 _log("  issues: " + "; ".join(issues))
             else:
                 validation = result.get("_validation") or {}
+                benchmark = result.get("_benchmark") or {}
                 _log(
                     "  ok: "
                     f"segments={len(result.get('segments') or [])} "
                     f"text_len={validation.get('text_len')} "
-                    f"elapsed={result.get('_elapsed_seconds', 0):.1f}s"
+                    f"elapsed={result.get('_elapsed_seconds', 0):.1f}s "
+                    f"throughput={benchmark.get('audio_seconds_per_processing_second', 0):.2f}x "
+                    f"cost=${benchmark.get('modal_cost_usd', 0):.5f}"
                 )
 
     (output_dir / "results.json").write_text(

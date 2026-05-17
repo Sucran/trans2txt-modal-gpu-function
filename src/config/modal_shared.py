@@ -76,6 +76,10 @@ hf_build_secret = modal.Secret.from_dict({"HF_TOKEN": _hf_token_for_build})
 
 runtime_env = {
     "DEFAULT_MODEL_SIZE": os.getenv("DEFAULT_MODEL_SIZE", "large-v3"),
+    "MODEL_DOWNLOAD_RETRIES": os.getenv("MODEL_DOWNLOAD_RETRIES", "4"),
+    "MODEL_DOWNLOAD_RETRY_DELAY_SECONDS": os.getenv(
+        "MODEL_DOWNLOAD_RETRY_DELAY_SECONDS", "20"
+    ),
     "ASR_BACKEND": os.getenv("ASR_BACKEND", "whisper"),
     "QWEN_ASR_MODEL_ID": os.getenv(
         "QWEN_ASR_MODEL_ID", "Qwen/Qwen3-ASR-1.7B"
@@ -84,6 +88,15 @@ runtime_env = {
     "QWEN_FORCED_ALIGNER_MODEL_ID": os.getenv(
         "QWEN_FORCED_ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B"
     ),
+    "QWEN_ASR_RUNTIME": os.getenv("QWEN_ASR_RUNTIME", "transformers"),
+    "QWEN_TRANSFORMERS_BATCH_SIZE": os.getenv("QWEN_TRANSFORMERS_BATCH_SIZE", "1"),
+    "QWEN_VLLM_DTYPE": os.getenv("QWEN_VLLM_DTYPE", "bfloat16"),
+    "QWEN_ALIGNER_DTYPE": os.getenv("QWEN_ALIGNER_DTYPE", ""),
+    "QWEN_VLLM_BATCH_SIZE": os.getenv("QWEN_VLLM_BATCH_SIZE", "4"),
+    "QWEN_VLLM_GPU_MEMORY_UTILIZATION": os.getenv(
+        "QWEN_VLLM_GPU_MEMORY_UTILIZATION", "0.70"
+    ),
+    "QWEN_VLLM_MAX_MODEL_LEN": os.getenv("QWEN_VLLM_MAX_MODEL_LEN", ""),
     "QWEN_ALIGNER_MAX_SEGMENT_SECONDS": os.getenv(
         "QWEN_ALIGNER_MAX_SEGMENT_SECONDS", "60"
     ),
@@ -113,7 +126,41 @@ def download_transcription_models() -> None:
     in runtime containers where the token is intentionally absent.
     """
     import os as _os
+    import time as _time
+    from urllib.parse import urlparse as _urlparse
     from pathlib import Path as _Path
+
+    def _retry(label: str, operation):
+        attempts_raw = _os.getenv("MODEL_DOWNLOAD_RETRIES", "4")
+        delay_raw = _os.getenv("MODEL_DOWNLOAD_RETRY_DELAY_SECONDS", "20")
+        try:
+            attempts = max(1, int(float(attempts_raw)))
+        except (TypeError, ValueError):
+            attempts = 4
+        try:
+            delay_seconds = max(1.0, float(delay_raw))
+        except (TypeError, ValueError):
+            delay_seconds = 20.0
+
+        last_exc = None
+        for attempt in range(1, attempts + 1):
+            try:
+                if attempt > 1:
+                    print(f"Retrying {label} (attempt {attempt}/{attempts})...", flush=True)
+                return operation()
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts:
+                    print(f"❌ {label} failed after {attempts} attempts: {exc!r}", flush=True)
+                    raise
+                sleep_for = min(delay_seconds * (2 ** (attempt - 1)), 180.0)
+                print(
+                    f"⚠️ {label} failed on attempt {attempt}/{attempts}: {exc!r}; "
+                    f"retrying in {sleep_for:.0f}s",
+                    flush=True,
+                )
+                _time.sleep(sleep_for)
+        raise RuntimeError(f"{label} failed") from last_exc
 
     hf_token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_TOKEN")
     if not hf_token:
@@ -133,7 +180,27 @@ def download_transcription_models() -> None:
 
     model_size = _os.getenv("DEFAULT_MODEL_SIZE", "large-v3")
     print(f"Downloading Whisper {model_size} model...")
-    whisper.load_model(model_size, download_root="/model")
+
+    def _remove_partial_whisper_download() -> None:
+        try:
+            url = getattr(whisper, "_MODELS", {}).get(model_size)
+            if not url:
+                return
+            target = model_cache_dir / _Path(_urlparse(url).path).name
+            if target.exists():
+                print(f"Removing partial Whisper checkpoint before retry: {target}", flush=True)
+                target.unlink()
+        except Exception as exc:
+            print(f"⚠️ Could not remove partial Whisper checkpoint: {exc!r}", flush=True)
+
+    def _load_whisper_with_cleanup():
+        try:
+            return whisper.load_model(model_size, download_root="/model")
+        except Exception:
+            _remove_partial_whisper_download()
+            raise
+
+    _retry(f"Whisper {model_size} download", _load_whisper_with_cleanup)
     print(f"Whisper {model_size} model downloaded and cached")
 
     # Modal / non-TTY logs often swallow tqdm carriage-return updates, so we
@@ -167,7 +234,10 @@ def download_transcription_models() -> None:
         th = threading.Thread(target=_beat, daemon=True)
         th.start()
         try:
-            return snapshot_download(repo_id, token=hf_token, max_workers=2)
+            return _retry(
+                f"HF snapshot {label}",
+                lambda: snapshot_download(repo_id, token=hf_token, max_workers=2),
+            )
         finally:
             stop.set()
 
@@ -255,7 +325,7 @@ transcription_image = (
         "huggingface_hub",
         "pyannote.audio>=4.0.0",
         "omegaconf",
-        "qwen-asr",
+        "qwen-asr[vllm]",
     )
     .run_function(
         download_transcription_models,

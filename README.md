@@ -30,16 +30,27 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
   - `MODAL_APP_NAME` (default `transcribe-modal-gpu`)
   - `MODAL_GPU_TYPE` (default `T4`)
   - `MODAL_CPU`, `MODAL_MEMORY`, `MODAL_GPU_TIMEOUT` etc.
+    The GPU function does not pin a Modal region by default, so benchmark
+    deployments avoid region selection premiums unless an operator adds one.
+  - `MODEL_DOWNLOAD_RETRIES` / `MODEL_DOWNLOAD_RETRY_DELAY_SECONDS` tune
+    build-time retries for Whisper and Hugging Face model prefetches. This is
+    useful when a Modal build sees transient connection resets while downloading
+    large model files.
   - `ASR_BACKEND` is only the fallback for older callers that do not pass
     `asr_backend`. Product routing should be done per request by the CPU
     function, based on the user's plan, with `asr_backend=whisper` or
     `asr_backend=qwen3_asr`.
   - `QWEN_ASR_MODEL_ID` / `QWEN_FORCED_ALIGNER_MODEL_ID` for the Qwen3-ASR
-    transformers backend. The default ASR model is `Qwen/Qwen3-ASR-1.7B` for
-    accuracy; `Qwen/Qwen3-ASR-0.6B` is the faster throughput-oriented option.
+    backend. The default ASR model is `Qwen/Qwen3-ASR-1.7B` for accuracy;
+    `Qwen/Qwen3-ASR-0.6B` is the faster throughput-oriented option.
     ForcedAligner is mandatory on the Qwen path so SRT timestamps keep the same
     contract as Whisper segments. T4 deployments use FP16 automatically; newer
     GPUs use BF16 when supported.
+  - `QWEN_ASR_RUNTIME` selects `transformers` (default) or `vllm`. For the L4
+    benchmark profile, use `QWEN_ASR_RUNTIME=vllm`,
+    `QWEN_VLLM_DTYPE=bfloat16`, `QWEN_VLLM_BATCH_SIZE=4`, and
+    `QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70`; then tune batch size upward only
+    after the 90s/300s/1800s smoke runs pass.
   - `QWEN_ALLOWED_ASR_MODEL_IDS` optionally allowlists request-level
     `asr_model_id` overrides. Blank means only the configured
     `QWEN_ASR_MODEL_ID` is accepted.
@@ -83,24 +94,37 @@ export HF_TOKEN=hf_your_token_here
 uv run modal deploy -m src.config.modal_gpu_config
 ```
 
-For an isolated Qwen3-ASR GPU direct-test deployment, keep the original app
+For an isolated Qwen3-ASR L4 + vLLM test deployment, keep the original app
 untouched and use a distinct Modal app name:
 
 ```bash
 export HF_TOKEN=hf_your_token_here
-export MODAL_APP_NAME=transcribe-modal-gpu-qwen3-dev
-export MODAL_GPU_TYPE=T4
+export MODAL_APP_NAME=transcribe-modal-gpu-qwen3-l4-vllm
+export MODAL_GPU_TYPE=L4
+export MODAL_CPU=4
+export MODAL_MEMORY=8192
 # Keep the fallback as Whisper; CPU decides Whisper vs Qwen per request by plan.
 export ASR_BACKEND=whisper
 export QWEN_ASR_MODEL_ID=Qwen/Qwen3-ASR-1.7B
 export QWEN_ALLOWED_ASR_MODEL_IDS=""
 export QWEN_FORCED_ALIGNER_MODEL_ID=Qwen/Qwen3-ForcedAligner-0.6B
+export QWEN_ASR_RUNTIME=vllm
+export QWEN_VLLM_DTYPE=bfloat16
+export QWEN_ALIGNER_DTYPE=
+export QWEN_VLLM_BATCH_SIZE=4
+export QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70
 export QWEN_ASR_CONTEXT=""
 export QWEN_ALIGNER_MAX_SEGMENT_SECONDS=60
 export QWEN_SUBTITLE_MAX_SECONDS=1.6
 export QWEN_SUBTITLE_MAX_CHARS=12
 export QWEN_SUBTITLE_GAP_SECONDS=0.35
-uv run modal deploy -m src.config.modal_gpu_config --name transcribe-modal-gpu-qwen3-dev
+uv run modal deploy -m src.config.modal_gpu_config --name transcribe-modal-gpu-qwen3-l4-vllm
+```
+
+The same profile is also available as:
+
+```bash
+HF_TOKEN=hf_your_token_here scripts/deploy_l4_vllm.sh
 ```
 
 After deploy, the Modal dashboard lists `transcribe_and_diarization_audio_function` (no separate web URL). The **Secrets** tab in the user's workspace will not contain any HF entry — that is the intended state.
@@ -114,14 +138,20 @@ uv run modal run src.config.modal_gpu_config::transcribe_and_diarization_audio_f
 
 ## Qwen3-ASR direct comparison smoke test
 
-After deploying `transcribe-modal-gpu-qwen3-dev`, run the comparison script
-against the original Whisper app and the isolated Qwen app:
+After deploying `transcribe-modal-gpu-qwen3-l4-vllm`, run the comparison script
+against the original app and the isolated L4 vLLM app:
 
 ```bash
-uv run python scripts/qwen3_gpu_direct_test.py
+uv run python scripts/qwen3_gpu_direct_test.py \
+  --new-app transcribe-modal-gpu-qwen3-l4-vllm \
+  --new-cost-gpu L4 \
+  --clips smoke,long,stress \
+  --cases new_qwen3
 ```
 
 The script downloads the configured Apple Podcast sample, cuts 90s and 300s
-clips with ffmpeg, calls `transcribe_and_diarization_audio_function` on both
-apps, and writes JSON/text/SRT artifacts under
-`/tmp/qwen3-asr-smoke/apple-1000767368971/`.
+clips (and an optional 1800s stress clip) with ffmpeg, calls
+`transcribe_and_diarization_audio_function`, and writes JSON/text/SRT artifacts
+under `/tmp/qwen3-asr-smoke/apple-1000767368971/`. Each result includes
+`_benchmark` fields for wall time, audio-seconds per processing-second, OOM
+detection, and Modal cost estimates using the configured GPU/CPU/memory prices.
