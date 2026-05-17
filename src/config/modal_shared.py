@@ -51,6 +51,7 @@ volume = modal.Volume.from_name("cache-volume", create_if_missing=True)
 cache_dir = "/root/cache"
 
 PYTHON_VERSION = "3.11"
+TORCHCODEC_VERSION = "0.9.1"
 
 # Standard HF cache layout. Same path is used at build time (so weights are
 # baked into the image) and at runtime (so offline lookups resolve correctly).
@@ -311,6 +312,10 @@ transcription_image = (
         "git+https://github.com/openai/whisper.git",
         "ffmpeg-python",
         "torchaudio",
+        # qwen-asr[vllm] currently resolves torch 2.9.x in the Modal image.
+        # TorchCodec's binary extension must match torch's minor version or
+        # pyannote emits a noisy libtorchcodec warning during startup.
+        f"torchcodec=={TORCHCODEC_VERSION}",
         "numpy",
         "librosa",
         "soundfile",

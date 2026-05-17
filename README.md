@@ -72,6 +72,11 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
     `32` / `32`)
   - `PYANNOTE_USE_MEMORY_INPUT` / `PYANNOTE_PROGRESS_HOOK` (default `true` / `true`)
 
+The Modal image pins `torchcodec` to the PyTorch-compatible version used by
+the Qwen3-ASR runtime. Pyannote still receives diarization audio as an
+in-memory waveform by default, but a compatible TorchCodec install keeps
+`pyannote.audio` startup free of libtorchcodec/FFmpeg ABI warnings.
+
 ## Hugging Face token (deploy-only, never user-facing)
 
 End users do **not** create or manage any Hugging Face Modal secret. The GPU image bakes pyannote, Qwen3-ASR, and Qwen3-ForcedAligner weights at build time and runs fully offline (`HF_HUB_OFFLINE=1`); `secrets = []` on the runtime function, so nothing HF-related shows up in the user's Modal workspace `Secrets` list.
