@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -55,6 +56,37 @@ class SpeakerDiarizationServiceHelperTests(unittest.TestCase):
                 "embedding_batch_size": 96,
             },
         )
+
+    def test_pipeline_audio_input_prefers_soundfile_memory_payload(self) -> None:
+        class FakeArray:
+            def __init__(self, shape: tuple[int, int]):
+                self.shape = shape
+
+            @property
+            def T(self) -> "FakeArray":
+                return FakeArray((self.shape[1], self.shape[0]))
+
+            def copy(self) -> "FakeArray":
+                return self
+
+        service = SpeakerDiarizationService()
+        fake_soundfile = types.SimpleNamespace(
+            read=lambda *_args, **_kwargs: (FakeArray((3, 1)), 16000)
+        )
+        fake_torch = types.SimpleNamespace(from_numpy=lambda array: array)
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "soundfile": fake_soundfile,
+                "torch": fake_torch,
+            },
+            clear=False,
+        ):
+            payload = service._pipeline_audio_input("/tmp/audio.wav")
+
+        self.assertEqual(payload["sample_rate"], 16000)
+        self.assertEqual(payload["waveform"].shape, (1, 3))
 
 
 if __name__ == "__main__":  # pragma: no cover

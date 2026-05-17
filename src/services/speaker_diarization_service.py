@@ -123,11 +123,29 @@ class SpeakerDiarizationService:
             return audio_file_path
 
         try:
+            import soundfile as sf
+            import torch
+
+            data, sample_rate = sf.read(
+                audio_file_path,
+                dtype="float32",
+                always_2d=True,
+            )
+            waveform = torch.from_numpy(data.T.copy())
+            print(
+                "📦 Loaded diarization audio into memory with soundfile: "
+                f"shape={tuple(waveform.shape)}, sample_rate={sample_rate}"
+            )
+            return {"waveform": waveform, "sample_rate": int(sample_rate)}
+        except Exception as e:
+            print(f"⚠️ soundfile audio preload failed, trying torchaudio: {e}")
+
+        try:
             import torchaudio
 
             waveform, sample_rate = torchaudio.load(audio_file_path)
             print(
-                "📦 Loaded diarization audio into memory: "
+                "📦 Loaded diarization audio into memory with torchaudio: "
                 f"shape={tuple(waveform.shape)}, sample_rate={sample_rate}"
             )
             return {"waveform": waveform, "sample_rate": sample_rate}
