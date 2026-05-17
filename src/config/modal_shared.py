@@ -96,7 +96,7 @@ runtime_env = {
     "QWEN_VLLM_GPU_MEMORY_UTILIZATION": os.getenv(
         "QWEN_VLLM_GPU_MEMORY_UTILIZATION", "0.70"
     ),
-    "QWEN_VLLM_MAX_MODEL_LEN": os.getenv("QWEN_VLLM_MAX_MODEL_LEN", ""),
+    "QWEN_VLLM_MAX_MODEL_LEN": os.getenv("QWEN_VLLM_MAX_MODEL_LEN", "8192"),
     "QWEN_ALIGNER_MAX_SEGMENT_SECONDS": os.getenv(
         "QWEN_ALIGNER_MAX_SEGMENT_SECONDS", "60"
     ),

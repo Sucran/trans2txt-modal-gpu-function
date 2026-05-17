@@ -29,12 +29,14 @@ MODAL_GPU_TYPE = os.getenv("MODAL_GPU_TYPE", "L4")
 MODAL_GPU_CPU = int(os.getenv("MODAL_CPU", "4"))
 MODAL_GPU_MEMORY = int(os.getenv("MODAL_MEMORY", "8192"))  # Default 8GB
 MODAL_GPU_TIMEOUT = int(os.getenv("MODAL_GPU_TIMEOUT", "1800"))  # 30 minutes
+MODAL_GPU_SCALEDOWN_WINDOW = int(os.getenv("MODAL_SCALEDOWN_WINDOW", "900"))
 
 print(f"🔧 Modal GPU Configuration:")
 print(f"   GPU Type: {MODAL_GPU_TYPE}")
 print(f"   CPU: {MODAL_GPU_CPU}")
 print(f"   Memory: {MODAL_GPU_MEMORY}MB")
 print(f"   Timeout: {MODAL_GPU_TIMEOUT}s")
+print(f"   Scaledown Window: {MODAL_GPU_SCALEDOWN_WINDOW}s")
 
 # ==================== Unified GPU Endpoint Configuration ====================
 
@@ -101,7 +103,7 @@ def _transcribe_and_diarization_audio_endpoint(request_data: dict):
     memory=MODAL_GPU_MEMORY,
     gpu=MODAL_GPU_TYPE,
     timeout=MODAL_GPU_TIMEOUT,
-    scaledown_window=40,  # 15 minutes before scaling down
+    scaledown_window=MODAL_GPU_SCALEDOWN_WINDOW,
     secrets=secrets,
 )
 def transcribe_and_diarization_audio_function(request_data: dict):
@@ -122,4 +124,5 @@ GPU_ENDPOINT_CONFIG = {
     "cpu_count": MODAL_GPU_CPU,
     "memory_mb": MODAL_GPU_MEMORY,
     "timeout_seconds": MODAL_GPU_TIMEOUT,
+    "scaledown_window_seconds": MODAL_GPU_SCALEDOWN_WINDOW,
 }

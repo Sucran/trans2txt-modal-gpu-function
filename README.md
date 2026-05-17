@@ -29,9 +29,12 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
 - Environment variables (can be set via `config.env` in project root, see `config.env.example`):
   - `MODAL_APP_NAME` (default `transcribe-modal-gpu`)
   - `MODAL_GPU_TYPE` (default `L4`)
-  - `MODAL_CPU`, `MODAL_MEMORY`, `MODAL_GPU_TIMEOUT` etc.
+  - `MODAL_CPU`, `MODAL_MEMORY`, `MODAL_GPU_TIMEOUT`,
+    `MODAL_SCALEDOWN_WINDOW` etc.
     The GPU function does not pin a Modal region by default, so benchmark
     deployments avoid region selection premiums unless an operator adds one.
+    The L4 vLLM profile keeps warm containers for 900s by default because
+    engine compilation/warmup can take over a minute on cold start.
   - `MODEL_DOWNLOAD_RETRIES` / `MODEL_DOWNLOAD_RETRY_DELAY_SECONDS` tune
     build-time retries for Whisper and Hugging Face model prefetches. This is
     useful when a Modal build sees transient connection resets while downloading
@@ -48,8 +51,9 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
     T4 deployments fall back to FP16 automatically.
   - `QWEN_ASR_RUNTIME` selects `vllm` (default) or `transformers`. The default
     L4 profile uses `QWEN_VLLM_DTYPE=bfloat16`, `QWEN_VLLM_BATCH_SIZE=4`, and
-    `QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70`; tune batch size upward only after
-    the 90s/300s/1800s smoke runs pass.
+    `QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70`. It also caps
+    `QWEN_VLLM_MAX_MODEL_LEN=8192` so 60s ASR subsegments can batch efficiently;
+    tune batch size upward only after the 90s/300s/1800s smoke runs pass.
   - `QWEN_ALLOWED_ASR_MODEL_IDS` optionally allowlists request-level
     `asr_model_id` overrides. Blank means only the configured
     `QWEN_ASR_MODEL_ID` is accepted.
@@ -104,6 +108,7 @@ export MODAL_APP_NAME=transcribe-modal-gpu-qwen3-l4-vllm
 export MODAL_GPU_TYPE=L4
 export MODAL_CPU=4
 export MODAL_MEMORY=8192
+export MODAL_SCALEDOWN_WINDOW=900
 # Keep the fallback as Whisper; CPU decides Whisper vs Qwen per request by plan.
 export ASR_BACKEND=whisper
 export QWEN_ASR_MODEL_ID=Qwen/Qwen3-ASR-1.7B
@@ -114,6 +119,7 @@ export QWEN_VLLM_DTYPE=bfloat16
 export QWEN_ALIGNER_DTYPE=
 export QWEN_VLLM_BATCH_SIZE=4
 export QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70
+export QWEN_VLLM_MAX_MODEL_LEN=8192
 export PYANNOTE_SEGMENTATION_BATCH_SIZE=256
 export PYANNOTE_EMBEDDING_BATCH_SIZE=256
 export QWEN_ASR_CONTEXT=""

@@ -24,6 +24,7 @@ DEFAULT_SUBTITLE_MAX_CHARS = 12
 DEFAULT_SUBTITLE_GAP_SECONDS = 0.35
 DEFAULT_VLLM_BATCH_SIZE = 4
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.70
+DEFAULT_VLLM_MAX_MODEL_LEN = 8192
 
 SENTENCE_ENDING_PUNCTUATION = set(".!?。！？…")
 CLAUSE_ENDING_PUNCTUATION = set(",;:，；：、")
@@ -187,6 +188,35 @@ def _resolve_torch_dtype_name(
     return value
 
 
+def _modal_gpu_supports_bf16() -> bool:
+    gpu_type = str(os.getenv("MODAL_GPU_TYPE", "")).strip().lower()
+    if not gpu_type:
+        return True
+    return "t4" not in gpu_type
+
+
+def _resolve_vllm_dtype_name(raw_value: Optional[str], default: str = "bfloat16") -> str:
+    raw = str(raw_value or default or "auto").strip().lower()
+    aliases = {
+        "auto": "auto",
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+        "fp16": "float16",
+        "float16": "float16",
+        "half": "float16",
+    }
+    value = aliases.get(raw, aliases.get(str(default).strip().lower(), "bfloat16"))
+    if value == "auto":
+        value = "bfloat16" if _modal_gpu_supports_bf16() else "float16"
+    if value == "bfloat16" and not _modal_gpu_supports_bf16():
+        print(
+            "⚠️ Requested bfloat16 but configured GPU does not support BF16; "
+            "falling back to float16"
+        )
+        return "float16"
+    return value
+
+
 def _torch_dtype_from_name(torch_module: Any, dtype_name: str) -> Any:
     if dtype_name == "bfloat16":
         return torch_module.bfloat16
@@ -303,13 +333,11 @@ class QwenAsrService:
         import torch
         from qwen_asr import Qwen3ASRModel
 
-        dtype_name = _resolve_torch_dtype_name(
-            torch,
+        dtype_name = _resolve_vllm_dtype_name(
             os.getenv("QWEN_VLLM_DTYPE"),
             default="bfloat16",
         )
-        aligner_dtype_name = _resolve_torch_dtype_name(
-            torch,
+        aligner_dtype_name = _resolve_vllm_dtype_name(
             os.getenv("QWEN_ALIGNER_DTYPE"),
             default=dtype_name,
         )
@@ -322,7 +350,10 @@ class QwenAsrService:
             "dtype": dtype_name,
             "gpu_memory_utilization": gpu_memory_utilization,
         }
-        max_model_len = _read_env_int("QWEN_VLLM_MAX_MODEL_LEN", 0)
+        max_model_len = _read_env_int(
+            "QWEN_VLLM_MAX_MODEL_LEN",
+            DEFAULT_VLLM_MAX_MODEL_LEN,
+        )
         if max_model_len > 0:
             kwargs["max_model_len"] = max_model_len
 
@@ -330,6 +361,7 @@ class QwenAsrService:
             "   Qwen3-ASR vLLM config: "
             f"dtype={dtype_name}, aligner_dtype={aligner_dtype_name}, "
             f"gpu_memory_utilization={gpu_memory_utilization}, "
+            f"max_model_len={max_model_len}, "
             f"batch={self.inference_batch_size}"
         )
         return Qwen3ASRModel.LLM(

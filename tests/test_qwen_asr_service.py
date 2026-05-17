@@ -103,6 +103,16 @@ class QwenAsrServiceHelperTests(unittest.TestCase):
             "float16",
         )
 
+    def test_vllm_bf16_falls_back_to_fp16_on_t4_without_cuda_probe(self) -> None:
+        with mock.patch.dict(os.environ, {"MODAL_GPU_TYPE": "T4"}, clear=False):
+            self.assertEqual(qwen._resolve_vllm_dtype_name("bfloat16"), "float16")
+            self.assertEqual(qwen._resolve_vllm_dtype_name("auto"), "float16")
+
+    def test_vllm_bf16_is_kept_on_l4_without_cuda_probe(self) -> None:
+        with mock.patch.dict(os.environ, {"MODAL_GPU_TYPE": "L4"}, clear=False):
+            self.assertEqual(qwen._resolve_vllm_dtype_name("bfloat16"), "bfloat16")
+            self.assertEqual(qwen._resolve_vllm_dtype_name("auto"), "bfloat16")
+
     def test_qwen_runtime_normalisation(self) -> None:
         self.assertEqual(qwen._normalise_qwen_runtime("vllm"), "vllm")
         self.assertEqual(qwen._normalise_qwen_runtime("VLLM"), "vllm")
