@@ -9,9 +9,20 @@ from pathlib import Path
 
 import modal
 
+
+def _resolve_repo_root(current_file: Path | None = None) -> Path:
+    """Find the directory that owns the copied ``src`` tree."""
+
+    resolved_file = (current_file or Path(__file__)).resolve()
+    for candidate in resolved_file.parents:
+        if (candidate / "src" / "config" / "modal_shared.py").is_file():
+            return candidate
+    return resolved_file.parent
+
+
 # `modal deploy` on this file loads it as a top-level module (not as `src.config.*`),
 # so `from .modal_shared` fails. Prefer imports from the repo root.
-_repo_root = Path(__file__).resolve().parents[2]
+_repo_root = _resolve_repo_root()
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
