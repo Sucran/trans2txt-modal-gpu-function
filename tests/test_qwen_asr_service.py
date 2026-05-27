@@ -90,6 +90,18 @@ class _FakeQwenModel:
         return ["ok"]
 
 
+class _FakeSleepableVllm:
+    def __init__(self):
+        self.sleep_calls: list[dict[str, object]] = []
+        self.wake_calls = 0
+
+    def sleep(self, level: int = 0) -> None:
+        self.sleep_calls.append({"level": level})
+
+    def wake_up(self) -> None:
+        self.wake_calls += 1
+
+
 class QwenAsrServiceHelperTests(unittest.TestCase):
     def test_dtype_auto_uses_fp16_when_bf16_is_not_supported(self) -> None:
         self.assertEqual(qwen._select_torch_dtype(_FakeTorch(True, False)), "fp16")
@@ -112,6 +124,20 @@ class QwenAsrServiceHelperTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MODAL_GPU_TYPE": "L4"}, clear=False):
             self.assertEqual(qwen._resolve_vllm_dtype_name("bfloat16"), "bfloat16")
             self.assertEqual(qwen._resolve_vllm_dtype_name("auto"), "bfloat16")
+
+    def test_vllm_drops_incompatible_expandable_segments_alloc_conf(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYTORCH_ALLOC_CONF": "max_split_size_mb:128,expandable_segments:True",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+            clear=False,
+        ):
+            qwen._drop_vllm_incompatible_torch_alloc_conf()
+
+            self.assertEqual(os.environ["PYTORCH_ALLOC_CONF"], "max_split_size_mb:128")
+            self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", os.environ)
 
     def test_qwen_runtime_normalisation(self) -> None:
         self.assertEqual(qwen._normalise_qwen_runtime("vllm"), "vllm")
@@ -174,6 +200,35 @@ class QwenAsrServiceHelperTests(unittest.TestCase):
         batches = list(service._iter_transcription_batches(inputs))
 
         self.assertEqual(batches, [[inputs[0]], [inputs[1]]])
+
+    def test_vllm_snapshot_sleep_and_wake_hooks(self) -> None:
+        service = object.__new__(qwen.QwenAsrService)
+        service.runtime = "vllm"
+        fake_vllm = _FakeSleepableVllm()
+        service.model = types.SimpleNamespace(llm=fake_vllm)
+
+        with mock.patch.dict(os.environ, {"QWEN_VLLM_ENABLE_SLEEP_MODE": "true"}, clear=False):
+            service.prepare_for_snapshot()
+            service.restore_from_snapshot()
+
+        self.assertEqual(fake_vllm.sleep_calls, [{"level": 1}])
+        self.assertEqual(fake_vllm.wake_calls, 1)
+        self.assertFalse(service._vllm_is_asleep)
+
+    def test_vllm_snapshot_sleep_is_idempotent_until_wake(self) -> None:
+        service = object.__new__(qwen.QwenAsrService)
+        service.runtime = "vllm"
+        fake_vllm = _FakeSleepableVllm()
+        service.model = types.SimpleNamespace(llm=fake_vllm)
+
+        with mock.patch.dict(os.environ, {"QWEN_VLLM_ENABLE_SLEEP_MODE": "true"}, clear=False):
+            service._sleep_vllm("before Modal snapshot")
+            service._sleep_vllm("before Modal snapshot again")
+            service.ensure_awake()
+
+        self.assertEqual(fake_vllm.sleep_calls, [{"level": 1}])
+        self.assertEqual(fake_vllm.wake_calls, 1)
+        self.assertFalse(service._vllm_is_asleep)
 
     def test_parse_time_stamps_accepts_tuples_dicts_and_objects(self) -> None:
         service = object.__new__(qwen.QwenAsrService)

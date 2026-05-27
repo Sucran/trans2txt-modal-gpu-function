@@ -1,10 +1,12 @@
 # transcribe-modal-gpu
 
-GPU-side Modal app. Deploys a Modal App named `transcribe-modal-gpu` with a single exposed function:
+GPU-side Modal app. Deploys a Modal App named `transcribe-modal-gpu` with split snapshot-backed GPU runtimes plus compatibility routers:
 
-- `transcribe_and_diarization_audio_function` — pure Python Modal function invoked from other Modal projects (or `modal run`) via `modal.Function.from_name(...).call()` / `.spawn(...)`. There is no HTTP entry point; long-running work is expected to use Modal’s function timeouts, not a request gateway.
+- `TranscribeAudioRuntime.process` — ASR-only GPU class. It can preload Qwen3-ASR plus `Qwen/Qwen3-ForcedAligner-0.6B` inside `@modal.enter(snap=True)` so Modal can restore the ASR container from a memory/GPU snapshot on cold start. Whisper remains on the existing fallback chain.
+- `SpeakerDiarizationAudioRuntime.process` — diarization-only GPU class. It preloads pyannote in a separate Modal container/snapshot so it never shares L4 VRAM with Qwen.
+- `transcribe_and_diarization_audio_function` — lightweight compatibility router kept for existing callers using `modal.Function.from_name(...).call()` / `.spawn(...)`. There is no HTTP entry point; long-running work is expected to use Modal’s function timeouts, not a request gateway.
 
-The handler dispatches internally to either Whisper transcription (for single chunks) or pyannote speaker diarization based on the request payload shape / `request_type` field. See `src/config/modal_gpu_config.py` for the dispatcher.
+The routers dispatch to either ASR or pyannote speaker diarization based on the request payload shape / `request_type` field. See `src/config/modal_gpu_config.py` for the dispatcher.
 
 ## Layout
 
@@ -12,7 +14,7 @@ The handler dispatches internally to either Whisper transcription (for single ch
 src/
   config/
     modal_shared.py          # Modal App, image, volume, model preloading
-    modal_gpu_config.py      # GPU Modal function definition
+    modal_gpu_config.py      # GPU Modal class/function definitions
   services/
     whisper_service.py       # Whisper runtime
     speaker_diarization_service.py  # pyannote runtime
@@ -35,6 +37,18 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
     deployments avoid region selection premiums unless an operator adds one.
     The L4 vLLM profile keeps warm containers for 900s by default because
     engine compilation/warmup can take over a minute on cold start.
+  - `MODAL_GPU_ENABLE_MEMORY_SNAPSHOT` / `MODAL_GPU_ENABLE_GPU_SNAPSHOT`
+    default to `true`. The runtime follows Modal's GPU snapshot pattern:
+    `enable_memory_snapshot=True`, `experimental_options={"enable_gpu_snapshot": True}`,
+    and model construction inside `@modal.enter(snap=True)`.
+  - `MODAL_GPU_SNAPSHOT_PRELOAD` chooses the GPU-heavy targets loaded into
+    snapshots: `auto`, `whisper`, `qwen3_asr`, `diarization`, a comma-separated
+    ASR+diarization pair, or `none`. The default is `qwen3_asr,diarization`;
+    `qwen3_asr` preloads both Qwen3-ASR and `Qwen/Qwen3-ForcedAligner-0.6B` in
+    the ASR runtime, while `diarization` preloads pyannote in its own runtime.
+    `auto` is still available if you want the snapshot target to follow
+    `ASR_BACKEND`. Only one ASR backend is preloaded because the ASR runtime
+    intentionally avoids Whisper + Qwen + ForcedAligner VRAM co-residency.
   - `MODEL_DOWNLOAD_RETRIES` / `MODEL_DOWNLOAD_RETRY_DELAY_SECONDS` tune
     build-time retries for Whisper and Hugging Face model prefetches. This is
     useful when a Modal build sees transient connection resets while downloading
@@ -54,6 +68,12 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
     `QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70`. It also caps
     `QWEN_VLLM_MAX_MODEL_LEN=8192` so 60s ASR subsegments can batch efficiently;
     tune batch size upward only after the 90s/300s/1800s smoke runs pass.
+    `QWEN_VLLM_ENABLE_SLEEP_MODE=true` lets the snapshot loader attempt the
+    vLLM sleep/wake pattern used by Modal's LFM example when the qwen-asr
+    wrapper exposes those lifecycle hooks.
+    Avoid setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` globally
+    for this profile: vLLM's memory pool is not compatible with expandable
+    segments.
   - `QWEN_ALLOWED_ASR_MODEL_IDS` optionally allowlists request-level
     `asr_model_id` overrides. Blank means only the configured
     `QWEN_ASR_MODEL_ID` is accepted.
@@ -114,6 +134,9 @@ export MODAL_GPU_TYPE=L4
 export MODAL_CPU=4
 export MODAL_MEMORY=8192
 export MODAL_SCALEDOWN_WINDOW=900
+export MODAL_GPU_ENABLE_MEMORY_SNAPSHOT=true
+export MODAL_GPU_ENABLE_GPU_SNAPSHOT=true
+export MODAL_GPU_SNAPSHOT_PRELOAD=qwen3_asr,diarization
 # Keep the fallback as Whisper; CPU decides Whisper vs Qwen per request by plan.
 export ASR_BACKEND=whisper
 export QWEN_ASR_MODEL_ID=Qwen/Qwen3-ASR-1.7B
@@ -125,6 +148,7 @@ export QWEN_ALIGNER_DTYPE=
 export QWEN_VLLM_BATCH_SIZE=4
 export QWEN_VLLM_GPU_MEMORY_UTILIZATION=0.70
 export QWEN_VLLM_MAX_MODEL_LEN=8192
+export QWEN_VLLM_ENABLE_SLEEP_MODE=true
 export PYANNOTE_SEGMENTATION_BATCH_SIZE=256
 export PYANNOTE_EMBEDDING_BATCH_SIZE=256
 export QWEN_ASR_CONTEXT=""
@@ -141,7 +165,25 @@ The same profile is also available as:
 HF_TOKEN=hf_your_token_here scripts/deploy_l4_vllm.sh
 ```
 
-After deploy, the Modal dashboard lists `transcribe_and_diarization_audio_function` (no separate web URL). The **Secrets** tab in the user's workspace will not contain any HF entry — that is the intended state.
+After deploy, the Modal dashboard lists `TranscribeAudioRuntime`, `SpeakerDiarizationAudioRuntime`, and the compatibility function `transcribe_and_diarization_audio_function` (no separate web URL). The **Secrets** tab in the user's workspace will not contain any HF entry — that is the intended state.
+
+For new callers that can route explicitly, prefer the dedicated runtime:
+
+```python
+import modal
+
+Runtime = modal.Cls.from_name("transcribe-modal-gpu", "TranscribeAudioRuntime")
+call = Runtime().process.spawn(request_data)
+result = call.get()
+```
+
+Existing callers can continue using the router class or function:
+
+```python
+fn = modal.Function.from_name("transcribe-modal-gpu", "transcribe_and_diarization_audio_function")
+call = fn.spawn(request_data)
+result = call.get()
+```
 
 ## Local test of the pure function (one-shot invocation)
 

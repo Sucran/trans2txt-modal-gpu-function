@@ -34,5 +34,99 @@ class ModalGpuConfigPathTests(unittest.TestCase):
         self.assertEqual(_resolve_repo_root(entry), PROJECT_ROOT)
 
 
+class ModalGpuSnapshotConfigTests(unittest.TestCase):
+    def _module(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            return importlib.import_module("src.config.modal_gpu_config")
+
+    def test_gpu_snapshot_options_require_memory_snapshot(self) -> None:
+        module = self._module()
+
+        self.assertEqual(
+            module._snapshot_experimental_options(
+                memory_enabled=True,
+                gpu_enabled=True,
+            ),
+            {"enable_gpu_snapshot": True},
+        )
+        self.assertIsNone(
+            module._snapshot_experimental_options(
+                memory_enabled=False,
+                gpu_enabled=True,
+            )
+        )
+        self.assertIsNone(
+            module._snapshot_experimental_options(
+                memory_enabled=True,
+                gpu_enabled=False,
+            )
+        )
+
+    def test_snapshot_preload_auto_follows_asr_backend(self) -> None:
+        module = self._module()
+
+        self.assertEqual(
+            module._resolve_snapshot_preload_targets("auto", "qwen3_asr"),
+            ["qwen3_asr"],
+        )
+        self.assertEqual(
+            module._resolve_snapshot_preload_targets("auto", "whisper"),
+            ["whisper"],
+        )
+        self.assertEqual(
+            module._resolve_snapshot_preload_targets("auto", "diarization"),
+            ["diarization"],
+        )
+
+    def test_snapshot_preload_keeps_one_asr_backend(self) -> None:
+        module = self._module()
+
+        self.assertEqual(
+            module._resolve_snapshot_preload_targets("qwen3_asr,whisper,diarization"),
+            ["qwen3_asr", "diarization"],
+        )
+        self.assertEqual(
+            module._resolve_snapshot_preload_targets("none"),
+            [],
+        )
+
+    def test_snapshot_preload_splits_asr_and_diarization_targets(self) -> None:
+        module = self._module()
+
+        with mock.patch.object(
+            module,
+            "MODAL_GPU_SNAPSHOT_PRELOAD",
+            "qwen3_asr,diarization",
+        ):
+            self.assertEqual(module._asr_snapshot_preload_targets(), ["qwen3_asr"])
+            self.assertTrue(module._diarization_snapshot_preload_enabled())
+
+    def test_request_payload_routes_to_dedicated_runtime_class(self) -> None:
+        module = self._module()
+
+        self.assertEqual(
+            module._runtime_class_name_for_request(
+                {"request_type": "transcribe", "audio_file_data": "..."}
+            ),
+            "TranscribeAudioRuntime",
+        )
+        self.assertEqual(
+            module._runtime_class_name_for_request(
+                {"request_type": "diarization", "audio_file_data": "..."}
+            ),
+            "SpeakerDiarizationAudioRuntime",
+        )
+        self.assertEqual(
+            module._runtime_class_name_for_request(
+                {"chunk_start_time": 0, "audio_file_data": "..."}
+            ),
+            "TranscribeAudioRuntime",
+        )
+        self.assertEqual(
+            module._runtime_class_name_for_request({"audio_file_data": "..."}),
+            "SpeakerDiarizationAudioRuntime",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

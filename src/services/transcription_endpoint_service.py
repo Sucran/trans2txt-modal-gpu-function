@@ -134,6 +134,22 @@ class TranscriptionEndpointService:
             _cached_backend = _CachedBackend(key=key, service=service)
             print(f"✅ Backend service cached: {key}")
             return service
+
+    def prepare_cached_backend_for_snapshot(self) -> None:
+        if _cached_backend is None:
+            return
+        service = _cached_backend.service
+        hook = getattr(service, "prepare_for_snapshot", None)
+        if callable(hook):
+            hook()
+
+    def restore_cached_backend_after_snapshot(self) -> None:
+        if _cached_backend is None:
+            return
+        service = _cached_backend.service
+        hook = getattr(service, "restore_from_snapshot", None)
+        if callable(hook):
+            hook()
     
     def _get_or_create_whisper_service(self, model_size: str) -> Any:
         """

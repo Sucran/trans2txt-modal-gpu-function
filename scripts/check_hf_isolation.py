@@ -7,8 +7,9 @@ Run with::
 The script imports the GPU Modal config in the *same* way `modal deploy` does
 and asserts:
 
-* ``transcribe_and_diarization_audio_function`` declares ``secrets=[]`` (no
-  named Hugging Face workspace secret is referenced at runtime).
+* The runtime exports ``secrets=[]`` for the compatibility function, ASR
+  runtime, and diarization runtime (no named Hugging Face workspace secret is
+  referenced at runtime).
 * The image build step uses an inline ``modal.Secret.from_dict``-style
   anonymous secret carrying ``HF_TOKEN`` — i.e. it is bundled into the
   deployment graph for this single deploy and is **not** a named workspace
@@ -45,7 +46,6 @@ def _import_with_token(token: str | None) -> "ModuleType":  # type: ignore[name-
 def main() -> None:
     cfg = _import_with_token("hf_test_token_e2e")
 
-    fn = cfg.transcribe_and_diarization_audio_function
     secret_names = [type(s).__name__ for s in cfg.secrets]
     print(f"runtime secrets list type names: {secret_names}")
     assert cfg.secrets == [], (
@@ -58,13 +58,18 @@ def main() -> None:
         "in the user's Modal workspace Secrets list."
     )
 
-    # The function reference reflects what `modal deploy` will register; if a
-    # named "huggingface-secret" sneaked in we'd find it here.
-    fn_repr = repr(fn)
-    assert "huggingface-secret" not in fn_repr, (
-        f"Function references a named 'huggingface-secret' workspace secret: {fn_repr}"
-    )
-    print("✅ function metadata does not reference any named HF workspace secret")
+    # The function and class references reflect what `modal deploy` will
+    # register; if a named "huggingface-secret" sneaked in we'd find it here.
+    deployed_refs = {
+        "function": repr(cfg.transcribe_and_diarization_audio_function),
+        "asr_class": repr(cfg.TranscribeAudioRuntime),
+        "diarization_class": repr(cfg.SpeakerDiarizationAudioRuntime),
+    }
+    for label, ref in deployed_refs.items():
+        assert "huggingface-secret" not in ref, (
+            f"{label} references a named 'huggingface-secret' workspace secret: {ref}"
+        )
+    print("✅ function/class metadata does not reference any named HF workspace secret")
 
     cfg2 = _import_with_token(None)
     assert cfg2.secrets == [], "Runtime container path must also report secrets=[]"

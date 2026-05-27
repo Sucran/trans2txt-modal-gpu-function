@@ -25,6 +25,7 @@ DEFAULT_SUBTITLE_GAP_SECONDS = 0.50
 DEFAULT_VLLM_BATCH_SIZE = 4
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.70
 DEFAULT_VLLM_MAX_MODEL_LEN = 8192
+VLLM_INCOMPATIBLE_TORCH_ALLOC_TOKENS = {"expandable_segments:True"}
 
 SENTENCE_ENDING_PUNCTUATION = set(".!?。！？…")
 CLAUSE_ENDING_PUNCTUATION = set(",;:，；：、")
@@ -118,6 +119,37 @@ def _get_attr_or_key(item: Any, *names: str) -> Any:
     return None
 
 
+def _drop_vllm_incompatible_torch_alloc_conf() -> None:
+    """
+    vLLM's CuMemAllocator memory pool rejects expandable_segments.
+
+    PyTorch sometimes suggests this setting after OOMs, but with vLLM 0.14 it
+    fails engine startup before any request can run. Strip only the known
+    incompatible token so other allocator settings can still pass through.
+    """
+
+    for env_name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        raw_value = os.getenv(env_name)
+        if not raw_value:
+            continue
+        tokens = [token.strip() for token in raw_value.split(",") if token.strip()]
+        kept_tokens = [
+            token
+            for token in tokens
+            if token not in VLLM_INCOMPATIBLE_TORCH_ALLOC_TOKENS
+        ]
+        if len(kept_tokens) == len(tokens):
+            continue
+        if kept_tokens:
+            os.environ[env_name] = ",".join(kept_tokens)
+        else:
+            os.environ.pop(env_name, None)
+        print(
+            f"⚠️ Removed vLLM-incompatible {env_name}=expandable_segments:True "
+            "before Qwen3-ASR vLLM startup"
+        )
+
+
 def _read_env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -138,6 +170,13 @@ def _read_env_int(name: str, default: int) -> int:
     except (TypeError, ValueError):
         return int(default)
     return value if value > 0 else int(default)
+
+
+def _read_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _normalise_qwen_runtime(runtime: Optional[str]) -> str:
@@ -333,6 +372,8 @@ class QwenAsrService:
         import torch
         from qwen_asr import Qwen3ASRModel
 
+        _drop_vllm_incompatible_torch_alloc_conf()
+
         dtype_name = _resolve_vllm_dtype_name(
             os.getenv("QWEN_VLLM_DTYPE"),
             default="bfloat16",
@@ -356,25 +397,150 @@ class QwenAsrService:
         )
         if max_model_len > 0:
             kwargs["max_model_len"] = max_model_len
+        if _read_env_bool("QWEN_VLLM_ENABLE_SLEEP_MODE", True):
+            kwargs["enable_sleep_mode"] = True
 
         print(
             "   Qwen3-ASR vLLM config: "
             f"dtype={dtype_name}, aligner_dtype={aligner_dtype_name}, "
             f"gpu_memory_utilization={gpu_memory_utilization}, "
             f"max_model_len={max_model_len}, "
-            f"batch={self.inference_batch_size}"
+            f"batch={self.inference_batch_size}, "
+            f"sleep_mode={kwargs.get('enable_sleep_mode', False)}"
         )
-        return Qwen3ASRModel.LLM(
-            model=self.asr_model_id,
-            forced_aligner=self.aligner_model_id,
-            forced_aligner_kwargs={
-                "dtype": aligner_dtype,
-                "device_map": "cuda:0",
-            },
-            max_inference_batch_size=self.inference_batch_size,
-            max_new_tokens=int(os.getenv("QWEN_MAX_NEW_TOKENS", "1024")),
-            **kwargs,
+        try:
+            return Qwen3ASRModel.LLM(
+                model=self.asr_model_id,
+                forced_aligner=self.aligner_model_id,
+                forced_aligner_kwargs={
+                    "dtype": aligner_dtype,
+                    "device_map": "cuda:0",
+                },
+                max_inference_batch_size=self.inference_batch_size,
+                max_new_tokens=int(os.getenv("QWEN_MAX_NEW_TOKENS", "1024")),
+                **kwargs,
+            )
+        except TypeError as exc:
+            if "enable_sleep_mode" not in kwargs:
+                raise
+            print(
+                "WARNING: Qwen3-ASR vLLM wrapper rejected enable_sleep_mode; "
+                "retrying without vLLM sleep mode: "
+                f"{exc}"
+            )
+            kwargs.pop("enable_sleep_mode", None)
+            return Qwen3ASRModel.LLM(
+                model=self.asr_model_id,
+                forced_aligner=self.aligner_model_id,
+                forced_aligner_kwargs={
+                    "dtype": aligner_dtype,
+                    "device_map": "cuda:0",
+                },
+                max_inference_batch_size=self.inference_batch_size,
+                max_new_tokens=int(os.getenv("QWEN_MAX_NEW_TOKENS", "1024")),
+                **kwargs,
+            )
+
+    def _iter_vllm_candidates(self) -> Iterable[Any]:
+        attrs = (
+            "llm",
+            "_llm",
+            "model",
+            "_model",
+            "engine",
+            "_engine",
+            "engine_client",
+            "_engine_client",
+            "asr_model",
+            "_asr_model",
         )
+        queue: List[Tuple[Any, int]] = [(getattr(self, "model", None), 0)]
+        seen: set[int] = set()
+        while queue:
+            candidate, depth = queue.pop(0)
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            yield candidate
+            if depth >= 2:
+                continue
+            for attr in attrs:
+                try:
+                    child = getattr(candidate, attr, None)
+                except Exception:
+                    continue
+                if child is not None and id(child) not in seen:
+                    queue.append((child, depth + 1))
+
+    def _call_first_vllm_method(
+        self,
+        method_name: str,
+        call_variants: List[Tuple[tuple, dict]],
+    ) -> bool:
+        for candidate in self._iter_vllm_candidates():
+            method = getattr(candidate, method_name, None)
+            if not callable(method):
+                continue
+            for args, kwargs in call_variants:
+                try:
+                    method(*args, **kwargs)
+                    print(
+                        f"✅ Called vLLM lifecycle method {method_name} "
+                        f"on {type(candidate).__name__}"
+                    )
+                    return True
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    print(
+                        f"WARNING: vLLM lifecycle method {method_name} failed "
+                        f"on {type(candidate).__name__}: {exc}"
+                    )
+                    return False
+        return False
+
+    def _sleep_vllm(self, reason: str) -> None:
+        if self.runtime != "vllm":
+            return
+        if not _read_env_bool("QWEN_VLLM_ENABLE_SLEEP_MODE", True):
+            return
+        if getattr(self, "_vllm_is_asleep", False):
+            print(f"♻️ Qwen3-ASR vLLM backend already asleep ({reason})")
+            return
+        slept = self._call_first_vllm_method(
+            "sleep",
+            [
+                ((), {"level": 1}),
+                ((1,), {}),
+                ((), {}),
+            ],
+        )
+        self._vllm_is_asleep = slept
+        if slept:
+            print(f"✅ Qwen3-ASR vLLM backend slept ({reason})")
+        else:
+            print(f"WARNING: Qwen3-ASR vLLM sleep hook not found ({reason})")
+
+    def prepare_for_snapshot(self) -> None:
+        self._sleep_vllm("before Modal snapshot")
+
+    def ensure_awake(self) -> None:
+        if self.runtime != "vllm" or not getattr(self, "_vllm_is_asleep", False):
+            return
+        woke = self._call_first_vllm_method(
+            "wake_up",
+            [
+                ((), {}),
+                ((), {"tags": ["weights"]}),
+            ],
+        )
+        if not woke:
+            raise RuntimeError("Qwen3-ASR vLLM backend was slept but could not wake up")
+        self._vllm_is_asleep = False
+        print("✅ Qwen3-ASR vLLM backend woke for transcription")
+
+    def restore_from_snapshot(self) -> None:
+        self.ensure_awake()
 
     def transcribe_audio(
         self,
@@ -386,6 +552,8 @@ class QwenAsrService:
         try:
             if enable_speaker_diarization:
                 print("⚠️ Qwen3-ASR chunk diarization is ignored; CPU merges full-audio pyannote diarization")
+
+            self.ensure_awake()
 
             requested_language = _normalise_language(language)
             context_text = _normalise_context(context)

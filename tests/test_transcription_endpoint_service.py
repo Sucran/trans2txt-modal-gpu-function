@@ -19,6 +19,9 @@ from src.services import transcription_endpoint_service as endpoint  # noqa: E40
 
 
 class TranscriptionEndpointServiceTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        endpoint._cached_backend = None
+
     def _request(self, **overrides: object) -> dict[str, object]:
         request: dict[str, object] = {
             "request_type": "transcribe",
