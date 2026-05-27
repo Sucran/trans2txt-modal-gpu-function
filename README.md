@@ -33,10 +33,9 @@ No orchestration code lives here. The client-side splitting/merging/concurrency 
   - `MODAL_GPU_TYPE` (default `L4`)
   - `MODAL_CPU`, `MODAL_MEMORY`, `MODAL_GPU_TIMEOUT`,
     `MODAL_SCALEDOWN_WINDOW` etc.
-    The GPU function does not pin a Modal region by default, so benchmark
-    deployments avoid region selection premiums unless an operator adds one.
-    The L4 vLLM profile keeps warm containers for 900s by default because
-    engine compilation/warmup can take over a minute on cold start.
+    The GPU runtimes pin `region=["ap"]` on both ASR and diarization classes.
+    The L4 vLLM profile keeps warm containers for 30s by default to limit
+    idle GPU cost; increase only if cold starts become too frequent.
   - `MODAL_GPU_ENABLE_MEMORY_SNAPSHOT` / `MODAL_GPU_ENABLE_GPU_SNAPSHOT`
     default to `true`. The runtime follows Modal's GPU snapshot pattern:
     `enable_memory_snapshot=True`, `experimental_options={"enable_gpu_snapshot": True}`,
@@ -133,7 +132,7 @@ export MODAL_APP_NAME=transcribe-modal-gpu-qwen3-l4-vllm
 export MODAL_GPU_TYPE=L4
 export MODAL_CPU=4
 export MODAL_MEMORY=8192
-export MODAL_SCALEDOWN_WINDOW=900
+export MODAL_SCALEDOWN_WINDOW=30
 export MODAL_GPU_ENABLE_MEMORY_SNAPSHOT=true
 export MODAL_GPU_ENABLE_GPU_SNAPSHOT=true
 export MODAL_GPU_SNAPSHOT_PRELOAD=qwen3_asr,diarization

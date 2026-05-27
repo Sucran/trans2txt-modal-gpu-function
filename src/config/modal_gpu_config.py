@@ -42,7 +42,7 @@ MODAL_GPU_TYPE = os.getenv("MODAL_GPU_TYPE", "L4")
 MODAL_GPU_CPU = int(os.getenv("MODAL_CPU", "4"))
 MODAL_GPU_MEMORY = int(os.getenv("MODAL_MEMORY", "8192"))  # Default 8GB
 MODAL_GPU_TIMEOUT = int(os.getenv("MODAL_GPU_TIMEOUT", "1800"))  # 30 minutes
-MODAL_GPU_SCALEDOWN_WINDOW = int(os.getenv("MODAL_SCALEDOWN_WINDOW", "900"))
+MODAL_GPU_SCALEDOWN_WINDOW = int(os.getenv("MODAL_SCALEDOWN_WINDOW", "30"))
 MODAL_GPU_ENABLE_MEMORY_SNAPSHOT = os.getenv(
     "MODAL_GPU_ENABLE_MEMORY_SNAPSHOT",
     "true",
@@ -240,6 +240,7 @@ def _diarization_snapshot_preload_enabled() -> bool:
     return "diarization" in _resolve_snapshot_preload_targets()
 
 @app.cls(
+    region=["ap"],
     image=transcription_image,
     volumes={cache_dir: volume},
     cpu=MODAL_GPU_CPU,
@@ -323,6 +324,7 @@ class TranscribeAudioRuntime:
 
 
 @app.cls(
+    region=["ap"],
     image=transcription_image,
     volumes={cache_dir: volume},
     cpu=MODAL_GPU_CPU,
